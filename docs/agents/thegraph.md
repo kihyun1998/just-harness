@@ -2,7 +2,7 @@
 
 ## What this project is
 
-A Rust agent harness in the style of Claude Code (memory and the rest), to run on top of local and low-capability LLMs; what it needs is still being worked out.
+A Rust coding-agent harness in the style of Claude Code, built to learn by building: it calls Claude Haiku 5.5 through the Claude Developer Platform's Messages API and implements context compaction, tool-result clearing, memory, sessions, permissions, hooks, subagents and MCP itself rather than using the API's server-side versions. Running on a local model through Ollama's Messages-compatible endpoint is a later goal.
 
 ## References
 
@@ -10,5 +10,6 @@ A Rust agent harness in the style of Claude Code (memory and the rest), to run o
 |---|---|---|---|
 | openai/codex `codex-rs/` | how it works | its source tree — raw | example |
 | aaif-goose/goose `crates/` | how it works | its source tree — raw | example |
-| Ollama API (`docs/openapi.yaml`) and llama.cpp `tools/server` | how it works | their specs and source — raw | binding |
+| Anthropic Messages API (platform.claude.com/docs) | how it works | the published docs — **summarized** | binding |
+| Ollama Anthropic compatibility (`docs/api/anthropic-compatibility.mdx`) | how it works | its docs in the source tree — raw | binding, for the later local-model goal |
 | Claude Code docs (code.claude.com/docs) | how it works | the published docs — **summarized** | example |
