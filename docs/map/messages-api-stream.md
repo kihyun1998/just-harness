@@ -18,6 +18,7 @@ How `src/api/` sends a request and turns the streamed reply into one `Message`, 
 
 - A `\r` that is the last byte held is not yet a line end: the next chunk may start with `\n`, and `\r\n` is one line end. `finish` settles it when the stream ends.
 - An event with no closing blank line at the end of the stream is dropped, as in the SDK and the SSE spec.
+- A comment line (`: keep-alive`) needs no branch of its own: it splits into an empty field name, and unknown field names are ignored.
 
 ## Retries and timeouts (`Client::send_with_retries`, `ReqwestTransport`)
 

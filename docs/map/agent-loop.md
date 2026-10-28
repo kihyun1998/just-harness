@@ -29,12 +29,12 @@ A reply cut at `max_tokens`, or ending with `refusal` or any stop reason other t
 
 ## History is append-only
 
-`run_turn` only pushes: the assistant message through `Message::to_param` (blocks unchanged, thinking `signature` included) and the tool-result message. Each request's `messages` is the previous request's plus two entries; `tests/agent.rs` checks the prefix byte for byte. Prompt caching (#6) depends on this.
+`run_turn` only pushes: the assistant message through `Message::to_param` (blocks unchanged, thinking `signature` included) and the tool-result message. Each request's `messages` starts with the previous request's, unchanged: two entries longer after a round of tool calls, one after a `pause_turn` resend. `tests/agent.rs` checks that prefix as parsed JSON. Prompt caching (#6) depends on this.
 
 ## Maintainer's calls (2026-10-28, each shown with its alternative)
 
 - **Iteration cap:** 50 requests per turn by default, `--max-iterations N` to change it. The SDK has no default cap. Reaching it ends the turn as `TurnEnd::IterationLimit`.
-- **Folder confinement:** `read_file`, `edit_file` and `search` refuse any path outside the working folder: absolute, `../`, or a symlink leading out. `shell` is not confined, so this guards against mistakes, not a hostile model. goose allows any absolute path.
+- **Folder confinement:** `read_file`, `edit_file` and `search` refuse any path that leads outside the working folder, whether absolute, through `../` or through a symlink; an absolute path inside it is allowed. `shell` is not confined, so this guards against mistakes, not a hostile model. goose allows any absolute path.
 - **Secrets:** `read_file` and `edit_file` refuse `.env` and `.env.*` (not `.env.example`), also when reached through a symlink, so the API key in the working folder's `.env` does not land in the conversation or on screen. `search` already skips hidden files; `shell` can still read it. Chosen 2026-10-28, shown against leaving it readable.
 - **Entry point:** a terminal REPL in `src/main.rs`, not a library plus example.
 

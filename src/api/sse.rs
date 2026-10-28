@@ -75,7 +75,6 @@ impl SseDecoder {
                 data: std::mem::take(&mut self.data).join("\n"),
             });
         }
-        // A comment line (`: ...`) has an empty field name and falls to `_`.
         let (field, value) = line.split_once(':').unwrap_or((line, ""));
         let value = value.strip_prefix(' ').unwrap_or(value);
         match field {

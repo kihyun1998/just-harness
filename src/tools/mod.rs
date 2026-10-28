@@ -52,7 +52,7 @@ pub trait Tool: Send + Sync {
     fn call<'a>(&'a self, input: &'a Value, ctx: &'a ToolContext) -> ToolFuture<'a>;
 
     /// Whether a call must be approved before it runs: true for tools that
-    /// change something. Required, so a new tool states it.
+    /// change something. It has no default.
     fn needs_approval(&self) -> bool;
 
     /// What the user sees before approving a call: by default the whole input.

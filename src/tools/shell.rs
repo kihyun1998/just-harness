@@ -10,8 +10,9 @@ use crate::api;
 
 pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
 pub const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
-/// Each of stdout and stderr is cut to this many lines and bytes.
+/// stdout and stderr each keep at most their last this many lines,
 pub const OUTPUT_LIMIT_LINES: usize = 2000;
+/// and at most their last this many bytes.
 pub const OUTPUT_LIMIT_BYTES: usize = 50_000;
 
 /// Runs a command with `sh -c` in the working folder, in its own process
