@@ -50,6 +50,20 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> api::Tool;
 
     fn call<'a>(&'a self, input: &'a Value, ctx: &'a ToolContext) -> ToolFuture<'a>;
+
+    /// Whether a call must be approved before it runs: true for tools that
+    /// change something. Required, so a new tool states it.
+    fn needs_approval(&self) -> bool;
+
+    /// What the user sees before approving a call: by default the whole input.
+    fn approval_preview(&self, input: &Value, _ctx: &ToolContext) -> String {
+        serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
+    }
+
+    /// What an allow-for-the-session answer covers: by default this exact input.
+    fn approval_key(&self, input: &Value) -> String {
+        input.to_string()
+    }
 }
 
 /// The working folder. Paths given to file tools resolve against it and may
@@ -148,6 +162,22 @@ impl ToolSet {
 
     pub fn definitions(&self) -> Vec<api::Tool> {
         self.tools.iter().map(|(_, t)| t.definition()).collect()
+    }
+
+    /// Whether the tool called `name` needs approval; false for an unknown name.
+    pub fn needs_approval(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|(n, tool)| n == name && tool.needs_approval())
+    }
+
+    /// The preview and session key for a call to `name`; for an unknown name,
+    /// the input itself.
+    pub fn approval_view(&self, name: &str, input: &Value, ctx: &ToolContext) -> (String, String) {
+        match self.tools.iter().find(|(n, _)| n == name) {
+            Some((_, tool)) => (tool.approval_preview(input, ctx), tool.approval_key(input)),
+            None => (input.to_string(), input.to_string()),
+        }
     }
 
     /// Runs the tool called `name`. An unknown name, and a tool that

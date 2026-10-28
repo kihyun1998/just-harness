@@ -42,6 +42,10 @@ impl Tool for Search {
     fn call<'a>(&'a self, input: &'a Value, ctx: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move { search(input, ctx).unwrap_or_else(ToolOutput::error) })
     }
+
+    fn needs_approval(&self) -> bool {
+        false
+    }
 }
 
 fn search(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {

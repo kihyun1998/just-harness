@@ -46,6 +46,26 @@ impl Tool for Shell {
     fn call<'a>(&'a self, input: &'a Value, ctx: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move { run(input, ctx).await.unwrap_or_else(ToolOutput::error) })
     }
+
+    fn needs_approval(&self) -> bool {
+        true
+    }
+
+    fn approval_preview(&self, input: &Value, _ctx: &ToolContext) -> String {
+        let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+        match input.get("timeout_secs").and_then(Value::as_u64) {
+            Some(secs) => format!("$ {command}\n(timeout {secs} s)"),
+            None => format!("$ {command}"),
+        }
+    }
+
+    fn approval_key(&self, input: &Value) -> String {
+        input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| input.to_string())
+    }
 }
 
 async fn run(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {

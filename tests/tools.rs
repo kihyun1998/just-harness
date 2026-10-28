@@ -5,7 +5,7 @@ mod support;
 
 use std::path::Path;
 
-use just_harness::agent::Agent;
+use just_harness::agent::{Agent, AllowAll};
 use just_harness::api::Client;
 use just_harness::tools::{ToolContext, builtin};
 use serde_json::{Value, json};
@@ -28,7 +28,7 @@ async fn call(root: &Path, name: &str, input: Value) -> (String, bool) {
         context,
     );
     agent
-        .run_turn(&mut vec![user("go")], &mut ())
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
         .await
         .unwrap();
     let result = &sent_body(&transport, 1)["messages"][2]["content"][0];
@@ -520,7 +520,7 @@ async fn cancelling_a_turn_kills_the_command_it_was_running() {
 
     let cancelled = tokio::time::timeout(
         std::time::Duration::from_millis(800),
-        agent.run_turn(&mut history, &mut ()),
+        agent.run_turn(&mut history, &mut (), &mut AllowAll),
     )
     .await;
 
@@ -594,4 +594,128 @@ async fn read_and_edit_refuse_env_files_but_not_the_example() {
     );
     assert!(!example_err, "{example}");
     assert_eq!(example, "     1\tANTHROPIC_API_KEY=");
+}
+
+/// Denies every call and records which tools it was asked about.
+struct DenyAll(Vec<String>);
+
+impl just_harness::agent::Approver for DenyAll {
+    async fn approve(
+        &mut self,
+        request: &just_harness::agent::ApprovalRequest<'_>,
+    ) -> just_harness::agent::Approval {
+        self.0.push(request.name.to_string());
+        just_harness::agent::Approval::Deny(None)
+    }
+}
+
+#[tokio::test]
+async fn shell_and_edit_file_ask_first_while_read_file_and_search_do_not() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.txt", "keep\n");
+    let calls = [
+        ("toolu_1", "read_file", json!({ "path": "a.txt" })),
+        ("toolu_2", "search", json!({ "pattern": "keep" })),
+        (
+            "toolu_3",
+            "edit_file",
+            json!({ "path": "a.txt", "old_string": "keep", "new_string": "gone" }),
+        ),
+        ("toolu_4", "shell", json!({ "command": "touch ran.txt" })),
+    ];
+    let transport = FakeTransport::new()
+        .respond(200, vec![&tool_reply(&calls, "tool_use")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let context = ToolContext::new(dir.path()).unwrap();
+    let agent = Agent::new(
+        Client::with_transport(config(), &transport),
+        "claude-haiku-5-5",
+        builtin(),
+        context,
+    );
+    let mut approver = DenyAll(Vec::new());
+
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut approver)
+        .await
+        .unwrap();
+
+    assert_eq!(approver.0, vec!["edit_file", "shell"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(!dir.path().join("ran.txt").exists());
+    let results = &sent_body(&transport, 1)["messages"][2]["content"];
+    assert_eq!(results[0]["content"], "     1\tkeep");
+    assert_eq!(results[1]["content"], "a.txt:1:keep");
+}
+
+/// Allows every call and records what each approval request showed.
+struct Recorder(Vec<(String, String, String)>);
+
+impl just_harness::agent::Approver for Recorder {
+    async fn approve(
+        &mut self,
+        request: &just_harness::agent::ApprovalRequest<'_>,
+    ) -> just_harness::agent::Approval {
+        self.0.push((
+            request.name.to_string(),
+            request.preview.clone(),
+            request.key.clone(),
+        ));
+        just_harness::agent::Approval::Allow
+    }
+}
+
+#[tokio::test]
+async fn approval_requests_show_the_command_or_the_edit_and_its_real_target() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "real.txt", "keep\n");
+    std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("notes.txt")).unwrap();
+    let calls = [
+        (
+            "toolu_1",
+            "shell",
+            json!({ "command": "echo hi", "timeout_secs": 5 }),
+        ),
+        (
+            "toolu_2",
+            "edit_file",
+            json!({ "path": "notes.txt", "old_string": "keep", "new_string": "gone\nmore" }),
+        ),
+    ];
+    let transport = FakeTransport::new()
+        .respond(200, vec![&tool_reply(&calls, "tool_use")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let context = ToolContext::new(dir.path()).unwrap();
+    let agent = Agent::new(
+        Client::with_transport(config(), &transport),
+        "claude-haiku-5-5",
+        builtin(),
+        context,
+    );
+    let mut approver = Recorder(Vec::new());
+
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut approver)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        approver.0[0],
+        (
+            "shell".into(),
+            "$ echo hi\n(timeout 5 s)".into(),
+            "echo hi".into()
+        )
+    );
+    assert_eq!(
+        approver.0[1],
+        (
+            "edit_file".into(),
+            "notes.txt -> real.txt\n- keep\n+ gone\n+ more".into(),
+            "notes.txt".into()
+        )
+    );
 }

@@ -21,12 +21,51 @@ pub trait Observer {
 
 impl Observer for () {}
 
+/// The answer to a tool call that needs approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Approval {
+    Allow,
+    /// Do not run it; the optional reason goes to the model.
+    Deny(Option<String>),
+    /// Do not run it or the reply's remaining calls, and end the turn after
+    /// the model's next reply.
+    Stop,
+}
+
+/// A tool call waiting for approval, with what to show and what an
+/// allow-for-the-session answer would cover.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalRequest<'a> {
+    pub name: &'a str,
+    pub input: &'a Value,
+    /// The tool's text for the user: the command, or the edit.
+    pub preview: String,
+    /// Equal keys are the same call for a session-wide allow.
+    pub key: String,
+}
+
+/// Decides tool calls whose tool needs approval.
+pub trait Approver {
+    fn approve(&mut self, request: &ApprovalRequest<'_>) -> impl Future<Output = Approval>;
+}
+
+/// Allows every call.
+pub struct AllowAll;
+
+impl Approver for AllowAll {
+    async fn approve(&mut self, _request: &ApprovalRequest<'_>) -> Approval {
+        Approval::Allow
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEnd {
     /// The model's last message ended with this stop reason.
     Stopped(Option<StopReason>),
     /// The iteration cap was reached with tool calls still being made.
     IterationLimit,
+    /// The user answered [`Approval::Stop`].
+    StoppedByUser,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,8 +112,10 @@ impl<T: Transport> Agent<T> {
         &self,
         history: &mut Vec<MessageParam>,
         observer: &mut impl Observer,
+        approver: &mut impl Approver,
     ) -> Result<TurnOutcome, ApiError> {
         let mut iterations = 0;
+        let mut user_stopped = false;
         loop {
             let mut request =
                 CreateMessageRequest::new(&self.model, self.max_tokens, history.clone());
@@ -84,71 +125,118 @@ impl<T: Transport> Agent<T> {
             iterations += 1;
             history.push(message.to_param());
 
+            if user_stopped {
+                if let Some(not_run) = not_run_results(&message, USER_STOPPED) {
+                    history.push(not_run);
+                }
+                return Ok(outcome(TurnEnd::StoppedByUser, iterations, message));
+            }
             let stopped = TurnEnd::Stopped(message.stop_reason.clone());
             match next_step(message.stop_reason.as_ref()) {
                 Step::Stop => {
-                    if let Some(not_run) = not_run_results(&message) {
+                    let why = format!("the reply stopped at {}", stop_reason_name(&message));
+                    if let Some(not_run) = not_run_results(&message, &why) {
                         history.push(not_run);
                     }
                     return Ok(outcome(stopped, iterations, message));
                 }
                 Step::Resume => {}
-                Step::RunTools => match self.run_tools(&message, observer).await {
-                    Some(results) => history.push(results),
+                Step::RunTools => match self.run_tools(&message, observer, approver).await {
+                    Some((results, stop)) => {
+                        history.push(results);
+                        user_stopped = stop;
+                    }
                     None => return Ok(outcome(stopped, iterations, message)),
                 },
             }
-            if iterations >= self.max_iterations {
+            if !user_stopped && iterations >= self.max_iterations {
                 return Ok(outcome(TurnEnd::IterationLimit, iterations, message));
             }
         }
     }
 
     /// The user message carrying one result per `tool_use` block, in order,
-    /// or `None` when the message has no tool calls.
+    /// and whether the user answered [`Approval::Stop`]; `None` when the
+    /// message has no tool calls. Calls after a stop are not run or asked.
     async fn run_tools(
         &self,
         message: &Message,
         observer: &mut impl Observer,
-    ) -> Option<MessageParam> {
+        approver: &mut impl Approver,
+    ) -> Option<(MessageParam, bool)> {
         let mut results = Vec::new();
+        let mut stopped = false;
         for block in &message.content {
-            if let BlockKind::ToolUse { id, name, input } = block.kind() {
-                observer.on_tool_call(name, input);
-                let output = self.tools.call(name, input, &self.context).await;
-                observer.on_tool_result(name, &output);
-                results.push(ContentBlock::tool_result(
-                    id,
-                    output.content,
-                    output.is_error,
-                ));
-            }
+            let BlockKind::ToolUse { id, name, input } = block.kind() else {
+                continue;
+            };
+            observer.on_tool_call(name, input);
+            let output = if stopped {
+                ToolOutput::error(not_run(USER_STOPPED))
+            } else if self.tools.needs_approval(name) {
+                let (preview, key) = self.tools.approval_view(name, input, &self.context);
+                let request = ApprovalRequest {
+                    name,
+                    input,
+                    preview,
+                    key,
+                };
+                match approver.approve(&request).await {
+                    Approval::Allow => self.tools.call(name, input, &self.context).await,
+                    Approval::Deny(None) => ToolOutput::error("The user denied this call."),
+                    Approval::Deny(Some(reason)) => {
+                        ToolOutput::error(format!("The user denied this call. Reason: {reason}"))
+                    }
+                    Approval::Stop => {
+                        stopped = true;
+                        ToolOutput::error(not_run(USER_STOPPED))
+                    }
+                }
+            } else {
+                self.tools.call(name, input, &self.context).await
+            };
+            observer.on_tool_result(name, &output);
+            results.push(ContentBlock::tool_result(
+                id,
+                output.content,
+                output.is_error,
+            ));
         }
-        (!results.is_empty()).then_some(MessageParam {
-            role: Role::User,
-            content: results,
-        })
+        (!results.is_empty()).then_some((
+            MessageParam {
+                role: Role::User,
+                content: results,
+            },
+            stopped,
+        ))
     }
 }
 
-/// For a reply that stopped with tool calls in it: one `is_error` result per
-/// call saying it was not run. `None` when the reply has no tool calls.
-fn not_run_results(message: &Message) -> Option<MessageParam> {
-    let reason = message
+const USER_STOPPED: &str = "the user stopped the turn";
+
+fn not_run(why: &str) -> String {
+    format!("Not run: {why}.")
+}
+
+fn stop_reason_name(message: &Message) -> String {
+    message
         .stop_reason
         .as_ref()
         .and_then(|r| serde_json::to_value(r).ok())
         .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| "no stop reason".into());
+        .unwrap_or_else(|| "no stop reason".into())
+}
+
+/// One `is_error` result per tool call in `message`, saying it was not run
+/// because of `why`. `None` when the message has no tool calls.
+fn not_run_results(message: &Message, why: &str) -> Option<MessageParam> {
     let results: Vec<ContentBlock> = message
         .content
         .iter()
         .filter_map(|block| match block.kind() {
-            BlockKind::ToolUse { id, .. } => Some(ContentBlock::tool_result(
-                id,
-                format!("Not run: the reply stopped at {reason}."),
-                true,
-            )),
+            BlockKind::ToolUse { id, .. } => {
+                Some(ContentBlock::tool_result(id, not_run(why), true))
+            }
             _ => None,
         })
         .collect();

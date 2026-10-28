@@ -38,6 +38,10 @@ impl Tool for ReadFile {
     fn call<'a>(&'a self, input: &'a Value, ctx: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move { read(input, ctx).unwrap_or_else(ToolOutput::error) })
     }
+
+    fn needs_approval(&self) -> bool {
+        false
+    }
 }
 
 fn read(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {

@@ -2,7 +2,7 @@ mod support;
 
 use std::sync::Mutex;
 
-use just_harness::agent::{Agent, TurnEnd};
+use just_harness::agent::{Agent, AllowAll, Approval, ApprovalRequest, Approver, TurnEnd};
 use just_harness::api::{self, Client, StopReason};
 use just_harness::tools::{Tool, ToolContext, ToolFuture, ToolOutput, ToolSet};
 use serde_json::{Value, json};
@@ -13,6 +13,7 @@ struct Echo {
     name: &'static str,
     output: ToolOutput,
     calls: Mutex<Vec<Value>>,
+    needs_approval: bool,
 }
 
 impl Echo {
@@ -21,6 +22,7 @@ impl Echo {
             name,
             output,
             calls: Mutex::new(Vec::new()),
+            needs_approval: false,
         }
     }
 }
@@ -39,6 +41,9 @@ impl Tool for &Echo {
         self.calls.lock().unwrap().push(input.clone());
         let output = self.output.clone();
         Box::pin(async move { output })
+    }
+    fn needs_approval(&self) -> bool {
+        self.needs_approval
     }
 }
 
@@ -69,7 +74,10 @@ async fn runs_a_requested_tool_and_sends_its_result_back() {
     let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
     let mut history = vec![user("What is the answer?")];
 
-    let outcome = agent.run_turn(&mut history, &mut ()).await.unwrap();
+    let outcome = agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.end, TurnEnd::Stopped(Some(StopReason::EndTurn)));
     assert_eq!(outcome.iterations, 2);
@@ -102,7 +110,10 @@ async fn returns_every_parallel_result_in_one_message_in_call_order() {
     let (agent, _dir) = agent(&transport, ToolSet::new().with(a).with(b));
     let mut history = vec![user("go")];
 
-    agent.run_turn(&mut history, &mut ()).await.unwrap();
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(
         sent_body(&transport, 1)["messages"][2],
@@ -125,7 +136,10 @@ async fn answers_tool_calls_cut_by_max_tokens_with_not_run_errors_instead_of_run
     let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
     let mut history = vec![user("go")];
 
-    let outcome = agent.run_turn(&mut history, &mut ()).await.unwrap();
+    let outcome = agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.end, TurnEnd::Stopped(Some(StopReason::MaxTokens)));
     assert!(echo.calls.lock().unwrap().is_empty());
@@ -146,7 +160,10 @@ async fn a_finished_reply_without_tool_calls_adds_nothing_after_it() {
     let (agent, _dir) = agent(&transport, ToolSet::new());
     let mut history = vec![user("go")];
 
-    agent.run_turn(&mut history, &mut ()).await.unwrap();
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(history.len(), 2);
 }
@@ -166,7 +183,10 @@ async fn resends_a_paused_turn_unchanged_without_running_tools() {
     let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
     let mut history = vec![user("go")];
 
-    let outcome = agent.run_turn(&mut history, &mut ()).await.unwrap();
+    let outcome = agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.end, TurnEnd::Stopped(Some(StopReason::EndTurn)));
     assert!(echo.calls.lock().unwrap().is_empty());
@@ -187,7 +207,10 @@ async fn stops_at_the_iteration_cap() {
     agent.max_iterations = 3;
     let mut history = vec![user("go")];
 
-    let outcome = agent.run_turn(&mut history, &mut ()).await.unwrap();
+    let outcome = agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.end, TurnEnd::IterationLimit);
     assert_eq!(outcome.iterations, 3);
@@ -218,7 +241,10 @@ async fn each_request_extends_the_previous_one_without_changing_it() {
     let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
     let mut history = vec![user("go")];
 
-    agent.run_turn(&mut history, &mut ()).await.unwrap();
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     let bodies: Vec<Value> = (0..3).map(|n| sent_body(&transport, n)).collect();
     for pair in bodies.windows(2) {
@@ -253,7 +279,10 @@ async fn sends_the_assistant_turn_back_with_its_thinking_block_unchanged() {
     let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
     let mut history = vec![user("go")];
 
-    agent.run_turn(&mut history, &mut ()).await.unwrap();
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(
         sent_body(&transport, 1)["messages"][1],
@@ -279,6 +308,10 @@ impl Tool for Panics {
     fn call<'a>(&'a self, _input: &'a Value, _ctx: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async { panic!("index out of range") })
     }
+
+    fn needs_approval(&self) -> bool {
+        false
+    }
 }
 
 #[tokio::test]
@@ -292,11 +325,164 @@ async fn a_panicking_tool_becomes_an_error_result_and_the_loop_goes_on() {
     let (agent, _dir) = agent(&transport, ToolSet::new().with(Panics));
     let mut history = vec![user("go")];
 
-    let outcome = agent.run_turn(&mut history, &mut ()).await.unwrap();
+    let outcome = agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.end, TurnEnd::Stopped(Some(StopReason::EndTurn)));
     assert_eq!(
         sent_body(&transport, 1)["messages"][2]["content"][0],
         json!({ "type": "tool_result", "tool_use_id": "toolu_1", "content": "Error: tool 'boom' panicked: index out of range", "is_error": true })
     );
+}
+
+fn guarded(name: &'static str) -> &'static Echo {
+    let mut echo = Echo::new(name, ToolOutput::ok("done"));
+    echo.needs_approval = true;
+    leak(echo)
+}
+
+/// Answers approvals from a script and records what it was asked.
+struct Scripted {
+    answers: std::collections::VecDeque<Approval>,
+    asked: Vec<(String, Value)>,
+}
+
+impl Scripted {
+    fn new(answers: Vec<Approval>) -> Self {
+        Self {
+            answers: answers.into(),
+            asked: Vec::new(),
+        }
+    }
+}
+
+impl Approver for Scripted {
+    async fn approve(&mut self, request: &ApprovalRequest<'_>) -> Approval {
+        self.asked
+            .push((request.name.to_string(), request.input.clone()));
+        self.answers
+            .pop_front()
+            .expect("asked more often than scripted")
+    }
+}
+
+#[tokio::test]
+async fn asks_only_about_tools_that_need_approval_and_runs_what_is_allowed() {
+    let read = leak(Echo::new("look", ToolOutput::ok("seen")));
+    let write = guarded("change");
+    let calls = [
+        ("toolu_1", "look", json!({ "a": 1 })),
+        ("toolu_2", "change", json!({ "b": 2 })),
+    ];
+    let transport = FakeTransport::new()
+        .respond(200, vec![&tool_reply(&calls, "tool_use")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let (agent, _dir) = agent(&transport, ToolSet::new().with(read).with(write));
+    let mut approver = Scripted::new(vec![Approval::Allow]);
+
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut approver)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        approver.asked,
+        vec![("change".to_string(), json!({ "b": 2 }))]
+    );
+    assert_eq!(read.calls.lock().unwrap().len(), 1);
+    assert_eq!(write.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_denied_call_is_not_run_and_the_reason_reaches_the_model() {
+    let write = guarded("change");
+    let calls = [
+        ("toolu_1", "change", json!({})),
+        ("toolu_2", "change", json!({})),
+    ];
+    let transport = FakeTransport::new()
+        .respond(200, vec![&tool_reply(&calls, "tool_use")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let (agent, _dir) = agent(&transport, ToolSet::new().with(write));
+    let mut approver = Scripted::new(vec![
+        Approval::Deny(Some("run the tests instead".into())),
+        Approval::Deny(None),
+    ]);
+
+    let outcome = agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut approver)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.end, TurnEnd::Stopped(Some(StopReason::EndTurn)));
+    assert!(write.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        sent_body(&transport, 1)["messages"][2]["content"],
+        json!([
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": "The user denied this call. Reason: run the tests instead", "is_error": true },
+            { "type": "tool_result", "tool_use_id": "toolu_2", "content": "The user denied this call.", "is_error": true }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn stop_skips_the_remaining_calls_and_ends_the_turn_after_one_more_reply() {
+    let write = guarded("change");
+    let calls = [
+        ("toolu_1", "change", json!({})),
+        ("toolu_2", "change", json!({})),
+    ];
+    let transport = FakeTransport::new()
+        .respond(200, vec![&tool_reply(&calls, "tool_use")])
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_3", "change", json!({}))], "tool_use")],
+        );
+    let (agent, _dir) = agent(&transport, ToolSet::new().with(write));
+    let mut approver = Scripted::new(vec![Approval::Stop]);
+    let mut history = vec![user("go")];
+
+    let outcome = agent
+        .run_turn(&mut history, &mut (), &mut approver)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.end, TurnEnd::StoppedByUser);
+    assert_eq!(approver.asked.len(), 1);
+    assert!(write.calls.lock().unwrap().is_empty());
+    assert_eq!(transport.requests().len(), 2);
+    let not_run = |id: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": "Not run: the user stopped the turn.", "is_error": true });
+    assert_eq!(
+        sent_body(&transport, 1)["messages"][2]["content"],
+        json!([not_run("toolu_1"), not_run("toolu_2")])
+    );
+    assert_eq!(history.len(), 5);
+    assert_eq!(
+        serde_json::to_value(&history[4]).unwrap()["content"],
+        json!([not_run("toolu_3")])
+    );
+}
+
+#[tokio::test]
+async fn stop_on_the_last_allowed_request_still_gets_its_one_more_reply() {
+    let write = guarded("change");
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "change", json!({}))], "tool_use")],
+        )
+        .respond(200, vec![&text_reply("stopping", "end_turn")]);
+    let (mut agent, _dir) = agent(&transport, ToolSet::new().with(write));
+    agent.max_iterations = 1;
+    let mut approver = Scripted::new(vec![Approval::Stop]);
+
+    let outcome = agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut approver)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.end, TurnEnd::StoppedByUser);
+    assert_eq!(transport.requests().len(), 2);
 }

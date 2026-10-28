@@ -2,7 +2,11 @@
 
 use std::io::Write;
 
-use just_harness::agent::{Agent, DEFAULT_MAX_ITERATIONS, Observer, TurnEnd};
+use std::collections::HashSet;
+
+use just_harness::agent::{
+    Agent, Approval, ApprovalRequest, Approver, DEFAULT_MAX_ITERATIONS, Observer, TurnEnd,
+};
 use just_harness::api::{Client, ClientConfig, ContentBlock, MessageParam, Role};
 use just_harness::tools::{ToolContext, ToolOutput, builtin};
 use serde_json::Value;
@@ -34,18 +38,29 @@ impl Observer for Terminal {
     }
 }
 
-/// `text` with control characters other than newline and tab shown as `�`,
-/// so model or file text cannot drive the terminal.
+/// `text` with the characters of [`hidden`] shown as `�`.
 fn printable(text: &str) -> String {
     text.chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
+        .map(|c| if hidden(c) { '\u{FFFD}' } else { c })
         .collect()
+}
+
+/// Control characters other than newline and tab, and invisible format
+/// characters that change how text reads: bidi controls, zero-width
+/// characters, the soft hyphen and the byte-order mark.
+fn hidden(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 fn one_line(text: &str, max: usize) -> String {
@@ -53,6 +68,65 @@ fn one_line(text: &str, max: usize) -> String {
     match flat.char_indices().nth(max) {
         Some((i, _)) => format!("{}...", &flat[..i]),
         None => flat,
+    }
+}
+
+/// Asks at the terminal before a tool that changes something runs.
+struct Prompt<'a> {
+    lines: &'a mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// Calls answered `a`: the tool and its command or file.
+    session: &'a mut HashSet<(String, String)>,
+}
+
+/// How many preview lines are shown before the rest is counted.
+const PREVIEW_LINES: usize = 40;
+
+impl Approver for Prompt<'_> {
+    async fn approve(&mut self, request: &ApprovalRequest<'_>) -> Approval {
+        let mut dropped = 0;
+        while self.lines.try_recv().is_ok() {
+            dropped += 1;
+        }
+        if dropped > 0 {
+            println!("  [{dropped} line(s) typed ahead were dropped]");
+        }
+        let key = (request.name.to_string(), request.key.clone());
+        if self.session.contains(&key) {
+            println!("  (allowed for this session)");
+            return Approval::Allow;
+        }
+        let lines: Vec<&str> = request.preview.lines().collect();
+        for line in lines.iter().take(PREVIEW_LINES) {
+            println!("  {}", printable(line));
+        }
+        if lines.len() > PREVIEW_LINES {
+            println!("  ... {} more lines", lines.len() - PREVIEW_LINES);
+        }
+        loop {
+            print!("  allow? [y]es / [n]o [reason] / [a]lways this session / [q]uit turn: ");
+            let _ = std::io::stdout().flush();
+            let Some(answer) = self.lines.recv().await else {
+                return Approval::Stop;
+            };
+            let answer = answer.trim();
+            let (word, rest) = answer
+                .split_once(char::is_whitespace)
+                .unwrap_or((answer, ""));
+            let reason = Some(rest.trim().to_string()).filter(|r| !r.is_empty());
+            match (word, &reason) {
+                ("y" | "yes", None) => return Approval::Allow,
+                ("a", None) => {
+                    self.session.insert(key);
+                    return Approval::Allow;
+                }
+                ("q", None) => return Approval::Stop,
+                ("n" | "no", _) => return Approval::Deny(reason),
+                ("y" | "yes" | "a" | "q", Some(_)) => {
+                    println!("  only n takes a reason; answer y, a or q on its own")
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -118,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Type a request. Ctrl-C cancels a running request; Ctrl-C or Ctrl-D at the prompt quits."
     );
     let mut history: Vec<MessageParam> = Vec::new();
+    let mut session = HashSet::new();
     let mut lines = input_lines();
     loop {
         print!("\n> ");
@@ -138,8 +213,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             content: vec![ContentBlock::text(line)],
         });
         let mut terminal = Terminal;
+        let mut approver = Prompt {
+            lines: &mut lines,
+            session: &mut session,
+        };
         let result = tokio::select! {
-            result = agent.run_turn(&mut history, &mut terminal) => Some(result),
+            result = agent.run_turn(&mut history, &mut terminal, &mut approver) => Some(result),
             _ = tokio::signal::ctrl_c() => None,
         };
         let Some(result) = result else {
@@ -151,6 +230,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(outcome) => {
                 let usage = &outcome.last_message.usage;
                 match outcome.end {
+                    TurnEnd::StoppedByUser => {
+                        println!("\n[stopped by you after {} requests]", outcome.iterations)
+                    }
                     TurnEnd::IterationLimit => {
                         println!(
                             "\n[stopped after {} requests: the iteration limit]",
