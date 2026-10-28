@@ -5,3 +5,4 @@ The territory map. A comment's why, trap and measured value go to a note here. N
 ## Notes
 
 - [Talking to the Messages API](messages-api-stream.md): `src/api/`, from request to assembled message.
+- [The agent loop and its tools](agent-loop.md): `src/agent.rs`, `src/tools/`, `src/main.rs`.

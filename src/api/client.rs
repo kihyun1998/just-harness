@@ -36,15 +36,17 @@ impl ClientConfig {
 
     /// Reads `ANTHROPIC_API_KEY`, and `ANTHROPIC_BASE_URL` when set.
     pub fn from_env() -> Result<Self, ApiError> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Reads `ANTHROPIC_API_KEY`, and `ANTHROPIC_BASE_URL` when set, through
+    /// `get`. Empty values count as unset.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ApiError> {
+        let get = |key: &str| get(key).filter(|v| !v.is_empty());
+        let api_key = get("ANTHROPIC_API_KEY")
             .ok_or_else(|| ApiError::Config("ANTHROPIC_API_KEY is not set".into()))?;
         let mut config = Self::new(api_key);
-        if let Some(url) = std::env::var("ANTHROPIC_BASE_URL")
-            .ok()
-            .filter(|u| !u.is_empty())
-        {
+        if let Some(url) = get("ANTHROPIC_BASE_URL") {
             config.base_url = url;
         }
         Ok(config)

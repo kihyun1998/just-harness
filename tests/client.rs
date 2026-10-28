@@ -1,133 +1,13 @@
-use std::collections::VecDeque;
-use std::sync::Mutex;
+mod support;
+
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::stream;
 use just_harness::api::{
-    ApiError, BlockKind, Client, ClientConfig, ContentBlock, CreateMessageRequest, HttpRequest,
-    HttpResponse, MessageParam, Role, StopReason, Tool, Transport,
+    ApiError, BlockKind, Client, ClientConfig, ContentBlock, HttpRequest, MessageParam, Role,
+    StopReason, Tool,
 };
 use serde_json::{Value, json};
-
-/// Status, headers and body chunks, or a transport failure.
-type QueuedResponse = Result<(u16, Vec<(String, String)>, Vec<Bytes>), String>;
-
-/// A transport that answers with queued responses and records each request.
-struct FakeTransport {
-    responses: Mutex<VecDeque<QueuedResponse>>,
-    requests: Mutex<Vec<HttpRequest>>,
-}
-
-impl FakeTransport {
-    fn new() -> Self {
-        Self {
-            responses: Mutex::new(VecDeque::new()),
-            requests: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn respond(self, status: u16, chunks: Vec<&str>) -> Self {
-        let chunks = chunks
-            .into_iter()
-            .map(|c| Bytes::from(c.to_string()))
-            .collect();
-        self.responses
-            .lock()
-            .unwrap()
-            .push_back(Ok((status, Vec::new(), chunks)));
-        self
-    }
-
-    fn respond_with_header(self, status: u16, header: (&str, &str), chunks: Vec<&str>) -> Self {
-        let chunks = chunks
-            .into_iter()
-            .map(|c| Bytes::from(c.to_string()))
-            .collect();
-        let headers = vec![(header.0.to_string(), header.1.to_string())];
-        self.responses
-            .lock()
-            .unwrap()
-            .push_back(Ok((status, headers, chunks)));
-        self
-    }
-
-    fn fail(self, message: &str) -> Self {
-        self.responses
-            .lock()
-            .unwrap()
-            .push_back(Err(message.to_string()));
-        self
-    }
-
-    fn requests(&self) -> Vec<HttpRequest> {
-        self.requests.lock().unwrap().clone()
-    }
-}
-
-impl Transport for &FakeTransport {
-    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ApiError> {
-        self.requests.lock().unwrap().push(request);
-        let (status, headers, chunks) = self
-            .responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("no response queued")
-            .map_err(ApiError::Transport)?;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body: Box::pin(stream::iter(chunks.into_iter().map(Ok))),
-        })
-    }
-}
-
-fn config() -> ClientConfig {
-    let mut config = ClientConfig::new("test-key");
-    config.base_url = "https://api.example.test/".into();
-    config.initial_retry_delay = Duration::ZERO;
-    config
-}
-
-fn request() -> CreateMessageRequest {
-    CreateMessageRequest::new(
-        "claude-haiku-5-5",
-        1024,
-        vec![MessageParam {
-            role: Role::User,
-            content: vec![ContentBlock::text("Hi")],
-        }],
-    )
-}
-
-/// One SSE event in the wire format: `event:` line, `data:` line, blank line.
-fn sse(data: Value) -> String {
-    format!(
-        "event: {}\ndata: {}\n\n",
-        data["type"].as_str().unwrap(),
-        data
-    )
-}
-
-fn message_start(input_tokens: u64) -> String {
-    sse(json!({
-        "type": "message_start",
-        "message": {
-            "id": "msg_01", "type": "message", "role": "assistant", "model": "claude-haiku-5-5",
-            "content": [], "stop_reason": null, "stop_sequence": null,
-            "usage": { "input_tokens": input_tokens, "output_tokens": 1 }
-        }
-    }))
-}
-
-fn message_end(stop_reason: &str, output_tokens: u64) -> String {
-    sse(json!({
-        "type": "message_delta",
-        "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-        "usage": { "output_tokens": output_tokens }
-    })) + &sse(json!({ "type": "message_stop" }))
-}
+use support::{FakeTransport, config, message_end, message_start, request, sse};
 
 #[tokio::test]
 async fn assembles_a_streamed_text_reply() {
@@ -650,4 +530,25 @@ async fn appends_citations_to_their_text_block() {
     let message = client.send(&request(), |_| {}).await.unwrap();
 
     assert_eq!(message.content[0].0["citations"], json!([first, second]));
+}
+
+#[test]
+fn config_from_lookup_reads_the_key_and_base_url_and_ignores_empty_values() {
+    let config = ClientConfig::from_lookup(|key| match key {
+        "ANTHROPIC_API_KEY" => Some("sk-ant-x".into()),
+        "ANTHROPIC_BASE_URL" => Some("http://localhost:11434".into()),
+        _ => None,
+    })
+    .unwrap();
+    let default_url = ClientConfig::from_lookup(|key| match key {
+        "ANTHROPIC_API_KEY" => Some("sk-ant-x".into()),
+        _ => Some(String::new()),
+    })
+    .unwrap();
+    let missing = ClientConfig::from_lookup(|_| Some(String::new()));
+
+    assert_eq!(config.api_key, "sk-ant-x");
+    assert_eq!(config.base_url, "http://localhost:11434");
+    assert_eq!(default_url.base_url, "https://api.anthropic.com");
+    assert!(matches!(missing, Err(ApiError::Config(_))));
 }

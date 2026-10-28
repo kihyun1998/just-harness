@@ -10,7 +10,7 @@ How `src/api/` sends a request and turns the streamed reply into one `Message`, 
 
 - Usage on `message_delta` is a running total. It replaces the value from `message_start`; adding the two double-counts.
 - Tool input arrives as JSON text split across `input_json_delta` events. It is buffered per block index and parsed once, in `finish`, after `message_delta` has set the stop reason.
-- Tool input that does not parse fails the message, except when the stop reason is `max_tokens`: then the block keeps the input it started with (usually `{}`) and the message, with the text and usage already paid for, is still returned. The agent loop has to check the stop reason before running any tool. Whether the API sends `content_block_stop` for a block cut by `max_tokens` has not been observed.
+- Tool input that does not parse fails the message, except when the stop reason is `max_tokens`: then the block keeps the input it started with (usually `{}`) and the message, with the text and usage already paid for, is still returned. The agent loop does not run tool calls from such a reply and answers them as not run ([agent-loop](agent-loop.md)). Whether the API sends `content_block_stop` for a block cut by `max_tokens` has not been observed.
 - A stream that ends without `message_stop` is a `Transport` error: the connection broke off. An event before `message_start` is a `Protocol` error.
 - SSE events with no `event:` name are skipped, as the SDK does. `ping` is skipped. An `error` event becomes `ApiError::Stream`.
 

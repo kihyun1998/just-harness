@@ -6,10 +6,14 @@ edition = "2024"
 [dependencies]
 bytes = "1.12.1"
 futures-util = "0.3.34"
+globset = "0.4.21"
+ignore = "0.4.34"
+regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json", "http2"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
