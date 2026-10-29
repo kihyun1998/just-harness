@@ -4,7 +4,9 @@
 //! `{"type":"message","message":<MessageParam>}` or
 //! `{"type":"drop","keep":<n>}`, which cuts the history back to its first `n`
 //! messages, or `{"type":"clear","before":<n>}`, which clears the tool results
-//! before message `n` as [`clear_before`] does.
+//! before message `n` as [`clear_before`] does, or
+//! `{"type":"compact","summary":<text>}`, which replaces the history with
+//! [`compacted`]`(summary)`.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -18,9 +20,10 @@ use serde_json::{Value, json};
 
 use crate::api::{BlockKind, ContentBlock, MessageParam, Role};
 use crate::clearing::clear_before;
+use crate::compaction::compacted;
 
 /// The format version written to new files; files with a higher one are refused.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The first line of a session file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +99,11 @@ impl SessionLog {
         self.write_line(&json!({ "type": "clear", "before": before }))
     }
 
+    /// Records that the history was compacted into `summary` ([`compacted`]).
+    pub fn record_compact(&mut self, summary: &str) -> std::io::Result<()> {
+        self.write_line(&json!({ "type": "compact", "summary": summary }))
+    }
+
     /// Writes one line and syncs it to the disk.
     fn write_line(&mut self, line: &Value) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(line)?;
@@ -146,6 +154,10 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
             },
             Some("drop") => match record["keep"].as_u64() {
                 Some(keep) => history.truncate(keep as usize),
+                None => skipped += 1,
+            },
+            Some("compact") => match record["summary"].as_str() {
+                Some(summary) => history = compacted(summary),
                 None => skipped += 1,
             },
             Some("clear") => match record["before"].as_u64() {

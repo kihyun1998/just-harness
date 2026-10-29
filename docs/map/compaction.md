@@ -1,0 +1,39 @@
+# Compaction
+
+How the REPL replaces a long conversation with a summary the model writes, and continues from that summary alone (`src/compaction.rs`, `Agent::send` in `src/agent.rs`, the turn start in `src/main.rs`, the `compact` record in `src/session.rs`). The API's server-side compaction is not used: the project implements it itself (#8, #11).
+
+## The shape: simple compaction
+
+After a compaction the history is one user message, `SUMMARY_PREFIX` and the summary, and the user's next line follows as a second user message (two user messages in a row are accepted, [agent-loop](agent-loop.md)). Nothing from before is replayed, so no thinking block is sent after a history it was not produced from ([tool-result-clearing](tool-result-clearing.md)), and no request can fail that check. The preserved-thinking page (platform.claude.com/docs/en/build-with-claude/preserved-thinking, "Compact on the client", read raw on 2026-10-29) recommends this shape and says Claude models are trained on long-horizon tasks with it. Keeping the last turns verbatim (keep-tail) would need their thinking stripped or the `drop_block` beta, because that thinking was produced against the history the summary replaced.
+
+Prior art, read from source: codex sends the history with its compaction prompt as the next user turn and keeps the user's own recent messages, up to 20,000 tokens, with the summary (`codex-rs/core/src/compact.rs`, prompt in `codex-rs/prompts/templates/compact/prompt.md`); goose summarizes in a separate call with its own system prompt and keeps the last user message (`crates/goose/src/context_mgmt/mod.rs`). `SUMMARY_REQUEST` takes codex's list of what a handoff summary holds. Claude Code (code.claude.com/docs context-window and prompt-caching pages, read raw on 2026-10-29) sends its summary request the same way, with the conversation's system prompt, tools and history ending in a summarization instruction, and keeps only the summary of the messages; after it, it puts back from disk CLAUDE.md, memory, up to five recently read or edited files (a file over 5,000 tokens as a path only) and invoked skills, and it stops compacting automatically after a few attempts when the context refills at once.
+
+Maintainer's call (2026-10-29, shown with codex keeping the user's own messages up to 20,000 tokens, goose keeping the last one, and Claude Code's reloading of files): the summary alone, with the user's new line after it. Reloading recent files and stopping after repeated failures are left to a later issue; CLAUDE.md belongs to project memory (#9).
+
+## The summary request
+
+`summary_request` is the history unchanged with `SUMMARY_REQUEST` appended as a user message, sent by `Agent::send` with the same model, `max_tokens`, system, tools, extra fields and cache markers as a turn's requests, as one request whose tool calls are not run. Because everything before the appended message is the request the last turn ended with, it reads that prefix from the cache, and the thinking in it is still valid. A separate call with its own system prompt, as goose makes, would read nothing from the cache.
+
+`tool_choice` is not set to forbid tools, although the request asks for no tool calls: the prompt-caching page says a change to `tool_choice` invalidates the cached messages, so the request would write the whole conversation to the cache again. The summary is the reply's text blocks joined (`summary`), and only from a reply that stopped at `end_turn` or `max_tokens`. A reply that stopped at a tool call or a refusal is not a summary even when it holds text: a sentence like "Let me check the log first." before a tool call would otherwise replace the whole conversation, for good, since the session file replays it; review found it. A reply with no summary, or a failed request, leaves the conversation whole and says so, and the next turn tries again: one more request of the whole conversation each turn, mostly read from the cache, until one succeeds. A summary cut at `max_tokens` is used and reported; `SUMMARY_REQUEST` asks for what remains to be done second, so a cut takes the record of what was done before it takes the next step.
+
+## When it compacts
+
+At the start of a user turn, before clearing ([tool-result-clearing](tool-result-clearing.md)) and before the user's line is added, when the last request of the last turn kept had a prompt and reply of `trigger_tokens` or more (`Usage::history_tokens`): the reply is in the history the next request sends, its thinking included, since Claude Haiku 5.5 keeps every earlier turn's thinking (thinking page, "Keep all prior turns"). Counting the prompt alone left the reply out, which lens found. A compaction makes clearing that turn moot. The docs say not to compact between a `tool_use` and its result; at a turn start the summary request comes after every result, so a history ending in results the model has not answered (the iteration cap, `q`) is summarized with them. One long turn is not compacted while it runs.
+
+Maintainer's call (2026-10-29, shown against counting with `POST /v1/messages/count_tokens` before every turn, which the issue named, and against counting only after a resume): the trigger is the last kept request's usage. `count_tokens` is free with a rate limit of its own (token-counting page, 2026-10-29) and Ollama's compatibility page lists it as not supported. The cost: the size of the line the user is about to send is not known, and the first turn after a resume has no usage, so it does not compact.
+
+`CompactPolicy::default()` triggers at 90,000 tokens. The prompt-caching page prices Claude Haiku 5.5 prompts over 100,000 tokens five times higher, and its context window is 1,000,000 tokens (model overview page), so the price step, not the window, sets the ceiling. 90,000 leaves 10,000 tokens for the next line and the turn's own growth before that step; that margin is a judgement, not a measurement. Clearing triggers lower, at 80,000, so it gets the first chance to keep the prompt down.
+
+## On disk
+
+The session file keeps every original message and adds `{"type":"compact","summary":<text>}`; `load` replaces the history with `compacted(summary)` at that point, and later `drop` and `clear` records count from the compacted history ([sessions](sessions.md)). As with `clear`, what `compacted` builds is part of the format: changing `SUMMARY_PREFIX` would change what a resumed session sends, which costs a cache write but fails no check, since nothing before the summary carries thinking.
+
+## The report
+
+The summary streams to the terminal like a reply, followed by `[compacted into a summary of N bytes]` and the request's token line. The REPL then forgets the last cached request whatever the outcome: after a compaction the prompt starts over, and after a failed one the next request does not extend the summary request, so comparing against it would report a changed prefix that did not change. Ctrl-C during the summary request cancels it and the line typed, and nothing is recorded.
+
+Checked on 2026-10-29 against a local fake API: a summary request answered with a tool call kept the conversation and wrote no record; after a turn reporting a 95,000-token prompt, the next line first sent the summary request, whose messages began with the previous request's and whose tools, system, cache markers, model and `max_tokens` were identical; the turn's request then held the summary message and the new line; `--continue` afterwards sent the same two messages first. A summary request answered with a 400 left the conversation whole and wrote no `compact` record. The REPL side is `compact` in `src/main.rs`, which has no automated test.
+
+## Not built
+
+No manual `/compact` command, no compaction inside a turn, no keeping the last turns verbatim, no `count_tokens`, and nothing for Ollama.

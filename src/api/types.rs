@@ -161,6 +161,12 @@ impl Usage {
             + self.cache_creation_input_tokens.unwrap_or(0)
     }
 
+    /// What the request's prompt and reply add up to: the size of the
+    /// history the next request starts from.
+    pub fn history_tokens(&self) -> u64 {
+        self.prompt_tokens() + self.output_tokens
+    }
+
     /// Adds `other` to this usage, field by field.
     pub fn add(&mut self, other: &Usage) {
         let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {

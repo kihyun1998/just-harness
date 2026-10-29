@@ -9,8 +9,13 @@ use std::time::{Duration, Instant};
 use just_harness::agent::{
     Agent, Approval, ApprovalRequest, Approver, DEFAULT_MAX_ITERATIONS, Observer, TurnEnd,
 };
-use just_harness::api::{Client, ClientConfig, ContentBlock, MessageParam, Role, Usage};
+use just_harness::api::{
+    Client, ClientConfig, ContentBlock, MessageParam, Role, StopReason, Transport, Usage,
+};
 use just_harness::clearing::{ClearPolicy, clear_before, plan};
+use just_harness::compaction::{
+    CompactPolicy, compacted, should_compact, summary, summary_request,
+};
 use just_harness::session::{
     FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, now_secs, sessions_dir,
 };
@@ -218,6 +223,75 @@ fn report_usage(usages: &[(Usage, Instant)], cached: &mut Option<(Usage, Instant
     }
 }
 
+/// How a compaction ended.
+enum Compacted {
+    /// The history is now the summary.
+    Done,
+    /// The history is unchanged: the request failed or gave no summary.
+    Kept,
+    /// Ctrl-C; the line typed is not sent.
+    Cancelled,
+}
+
+struct Compaction {
+    end: Compacted,
+    /// The summary request's usage, with when it ended.
+    usages: Vec<(Usage, Instant)>,
+}
+
+/// Asks for a summary of `history` and, when one comes back, replaces the
+/// history with it and records that in the session file.
+async fn compact<T: Transport>(
+    agent: &Agent<T>,
+    history: &mut Vec<MessageParam>,
+    log: &mut Log,
+    tokens: u64,
+) -> Compaction {
+    println!(
+        "[compacting {} message(s), about {tokens} tokens, into a summary]",
+        history.len()
+    );
+    let mut terminal = Terminal {
+        log,
+        usages: Vec::new(),
+    };
+    let result = tokio::select! {
+        result = agent.send(summary_request(history), &mut terminal) => Some(result),
+        _ = tokio::signal::ctrl_c() => None,
+    };
+    let usages = std::mem::take(&mut terminal.usages);
+    println!();
+    let end = match result {
+        None => {
+            println!("[compaction cancelled; your line was not sent]");
+            Compacted::Cancelled
+        }
+        Some(Err(error)) => {
+            println!("[compaction failed: {error}; the conversation is kept whole]");
+            Compacted::Kept
+        }
+        Some(Ok(message)) => match summary(&message) {
+            Some(text) => {
+                if message.stop_reason == Some(StopReason::MaxTokens) {
+                    println!("[the summary was cut at max_tokens]");
+                }
+                *history = compacted(&text);
+                log.record_compact(&text);
+                println!("[compacted into a summary of {} bytes]", text.len());
+                Compacted::Done
+            }
+            None => {
+                println!(
+                    "[compaction gave no summary (stop reason {:?}); the conversation is kept whole]",
+                    message.stop_reason
+                );
+                Compacted::Kept
+            }
+        },
+    };
+    Compaction { end, usages }
+}
+
 /// The session file: created with the first message, and given up after
 /// the first failed write so the file never has gaps.
 enum Log {
@@ -233,6 +307,10 @@ impl Log {
 
     fn drop_to(&mut self, keep: usize) {
         self.write(|file| file.drop_to(keep));
+    }
+
+    fn record_compact(&mut self, summary: &str) {
+        self.write(|file| file.record_compact(summary));
     }
 
     fn record_clear(&mut self, before: usize) {
@@ -407,7 +485,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut allowed = HashSet::new();
     let mut cached: Option<(Usage, Instant)> = None;
     let clearing = ClearPolicy::default();
-    // The prompt size of the last request of the last turn kept, in tokens.
+    let compacting = CompactPolicy::default();
+    // The prompt and reply of the last request of the last turn kept, in tokens.
     let mut last_prompt: Option<u64> = None;
     let mut lines = input_lines();
     loop {
@@ -422,6 +501,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if line.trim().is_empty() {
             continue;
+        }
+        if let Some(tokens) = last_prompt
+            && should_compact(&history, &compacting, tokens)
+        {
+            let compaction = compact(&agent, &mut history, &mut log, tokens).await;
+            report_usage(&compaction.usages, &mut cached, args.cache);
+            cached = None;
+            match compaction.end {
+                Compacted::Done => last_prompt = None,
+                Compacted::Kept => {}
+                Compacted::Cancelled => continue,
+            }
         }
         if let Some(boundary) = last_prompt.and_then(|tokens| plan(&history, &clearing, tokens)) {
             let cleared = clear_before(&mut history, boundary);
@@ -452,7 +543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => None,
         };
         let usages = std::mem::take(&mut terminal.usages);
-        last_prompt = usages.last().map(|(usage, _)| usage.prompt_tokens());
+        last_prompt = usages.last().map(|(usage, _)| usage.history_tokens());
         let Some(result) = result else {
             last_prompt = None;
             history.truncate(before);

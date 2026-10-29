@@ -761,6 +761,7 @@ fn prompt_tokens_count_uncached_input_and_cache_reads_and_writes() {
         cache_creation_input_tokens: Some(64),
     };
     assert_eq!(usage.prompt_tokens(), 1409);
+    assert_eq!(usage.history_tokens(), 1418);
     assert_eq!(Usage::default().prompt_tokens(), 0);
 }
 
@@ -794,4 +795,56 @@ async fn never_sends_more_than_four_cache_breakpoints() {
         body.get("cache_control").is_none(),
         "no slot is left for automatic caching"
     );
+}
+
+#[tokio::test]
+async fn a_single_request_has_the_turns_system_tools_and_cache_markers_and_runs_nothing() {
+    let echo: &'static Echo = Box::leak(Box::new(Echo::new("lookup", ToolOutput::ok("42"))));
+    let transport = FakeTransport::new()
+        .respond(200, vec![&text_reply("Hello.", "end_turn")])
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "lookup", json!({}))], "tool_use")],
+        );
+    let (mut agent, _dir) = agent(&transport, ToolSet::new().with(echo));
+    agent.system = vec![api::ContentBlock::text("You are a test.")];
+    agent
+        .extra
+        .insert("output_config".into(), json!({ "effort": "low" }));
+    let mut history = vec![user("hi")];
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+    let mut messages = history.clone();
+    messages.push(user("summarize"));
+    let mut usages = 0;
+    struct Count<'a>(&'a mut usize);
+    impl just_harness::agent::Observer for Count<'_> {
+        fn on_usage(&mut self, _usage: &api::Usage) {
+            *self.0 += 1;
+        }
+    }
+
+    let reply = agent
+        .send(messages.clone(), &mut Count(&mut usages))
+        .await
+        .unwrap();
+
+    let (turn, single) = (sent_body(&transport, 0), sent_body(&transport, 1));
+    for field in [
+        "model",
+        "max_tokens",
+        "system",
+        "tools",
+        "cache_control",
+        "output_config",
+    ] {
+        assert_eq!(single[field], turn[field], "{field}");
+    }
+    assert_eq!(single["messages"], serde_json::to_value(&messages).unwrap());
+    assert_eq!(reply.stop_reason, Some(StopReason::ToolUse));
+    assert!(echo.calls.lock().unwrap().is_empty());
+    assert_eq!(usages, 1);
+    assert_eq!(transport.requests().len(), 2);
 }

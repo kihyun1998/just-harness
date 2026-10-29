@@ -130,18 +130,9 @@ impl<T: Transport> Agent<T> {
         let mut usage = Usage::default();
         let mut user_stopped = false;
         loop {
-            let mut request =
-                CreateMessageRequest::new(&self.model, self.max_tokens, history.clone());
-            request.system = self.system.clone();
-            request.tools = self.tools.definitions();
-            request.extra = self.extra.clone();
-            if self.prompt_cache {
-                add_cache_breakpoints(&mut request);
-            }
-            let message = self.client.send(&request, |e| observer.on_event(e)).await?;
+            let message = self.send(history.clone(), observer).await?;
             iterations += 1;
             usage.add(&message.usage);
-            observer.on_usage(&message.usage);
             append(history, observer, message.to_param());
 
             if user_stopped {
@@ -182,6 +173,26 @@ impl<T: Transport> Agent<T> {
                 ));
             }
         }
+    }
+
+    /// Sends `messages` as one request with this agent's model, system,
+    /// tools, extra fields and cache markers, and reports its events and
+    /// usage. Tool calls in the reply are not run.
+    pub async fn send(
+        &self,
+        messages: Vec<MessageParam>,
+        observer: &mut impl Observer,
+    ) -> Result<Message, ApiError> {
+        let mut request = CreateMessageRequest::new(&self.model, self.max_tokens, messages);
+        request.system = self.system.clone();
+        request.tools = self.tools.definitions();
+        request.extra = self.extra.clone();
+        if self.prompt_cache {
+            add_cache_breakpoints(&mut request);
+        }
+        let message = self.client.send(&request, |e| observer.on_event(e)).await?;
+        observer.on_usage(&message.usage);
+        Ok(message)
     }
 
     /// The user message carrying one result per `tool_use` block, in order,

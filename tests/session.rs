@@ -4,6 +4,7 @@ use std::path::Path;
 
 use just_harness::api::{ContentBlock, MessageParam, Role};
 use just_harness::clearing::{CLEARED, clear_before};
+use just_harness::compaction::compacted;
 use just_harness::session::{
     FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, sessions_dir,
 };
@@ -136,6 +137,50 @@ fn a_clear_is_applied_again_on_load_where_it_was_recorded() {
     assert_eq!(loaded.history[7].content[0].block_type(), "thinking");
     assert_eq!(loaded.history[..8], history[..]);
     assert_eq!(loaded.skipped, 0);
+}
+
+#[test]
+fn a_compaction_replaces_the_history_with_its_summary_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    for m in [
+        text(Role::User, "list files"),
+        tool_call("toolu_1"),
+        tool_result("toolu_1"),
+        text(Role::Assistant, "One file."),
+    ] {
+        log.append(&m).unwrap();
+    }
+    log.record_compact("Listed the files: one.").unwrap();
+    let mut expected = compacted("Listed the files: one.");
+    for m in [
+        text(Role::User, "again"),
+        text(Role::Assistant, "Still one."),
+    ] {
+        log.append(&m).unwrap();
+        expected.push(m);
+    }
+
+    let loaded = load(log.path()).unwrap();
+
+    assert_eq!(loaded.history, expected);
+    assert_eq!(loaded.skipped, 0);
+}
+
+#[test]
+fn a_drop_after_a_compaction_counts_from_the_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    log.append(&text(Role::User, "first")).unwrap();
+    log.append(&text(Role::Assistant, "answer")).unwrap();
+    log.record_compact("Said hello.").unwrap();
+    log.append(&text(Role::User, "second")).unwrap();
+    log.append(&tool_call("toolu_1")).unwrap();
+    log.drop_to(1).unwrap();
+
+    let loaded = load(log.path()).unwrap();
+
+    assert_eq!(loaded.history, compacted("Said hello."));
 }
 
 #[test]
