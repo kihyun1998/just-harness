@@ -12,4 +12,6 @@ A Rust coding-agent harness in the style of Claude Code, built to learn by build
 | aaif-goose/goose `crates/` | how it works | its source tree — raw | example |
 | Anthropic Messages API (platform.claude.com/docs) | how it works | the published docs, raw Markdown at `<page>.md` | binding |
 | Ollama Anthropic compatibility (`docs/api/anthropic-compatibility.mdx`) | how it works | its docs in the source tree — raw | binding, for the later local-model goal |
-| Claude Code docs (code.claude.com/docs) | how it works | the published docs, raw Markdown at `<page>.md` | example |
+| Claude Code docs (code.claude.com/docs) | how it works | the published docs, raw Markdown at `<page>.md` | the target behaviour |
+
+Claude Code's behaviour is the target: where it and codex or goose differ, follow Claude Code, and ask the maintainer before departing from it. codex and goose are examples of how to build it. The Messages API docs bind over all three, since they say what a request may be. Maintainer's call, 2026-10-29.
