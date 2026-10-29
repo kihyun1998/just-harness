@@ -751,6 +751,19 @@ fn cache_shortfall_is_what_the_previous_request_left_cached_and_this_one_did_not
     assert_eq!(usage(0, 1600).cache_shortfall(&usage(1342, 64)), 1406);
 }
 
+#[test]
+fn prompt_tokens_count_uncached_input_and_cache_reads_and_writes() {
+    use just_harness::api::Usage;
+    let usage = Usage {
+        input_tokens: 3,
+        output_tokens: 9,
+        cache_read_input_tokens: Some(1342),
+        cache_creation_input_tokens: Some(64),
+    };
+    assert_eq!(usage.prompt_tokens(), 1409);
+    assert_eq!(Usage::default().prompt_tokens(), 0);
+}
+
 #[tokio::test]
 async fn never_sends_more_than_four_cache_breakpoints() {
     let transport = FakeTransport::new().respond(200, vec![&text_reply("ok", "end_turn")]);

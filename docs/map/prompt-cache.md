@@ -14,7 +14,7 @@ Maintainer's call (2026-10-29, shown with 1 hour and its 2x write): the 5-minute
 
 - The system prompt is fixed text plus the working folder, nothing time-dependent; the tool list is `builtin()` in a fixed order with descriptions built from constants.
 - serde_json is built without `preserve_order`, so JSON objects serialize with sorted keys (`cargo tree -e features -i serde_json`, 2026-10-29).
-- History is append-only ([agent-loop](agent-loop.md)), so each request's `messages` starts with the previous request's.
+- History is append-only within a turn ([agent-loop](agent-loop.md)), so each request's `messages` starts with the previous request's. Clearing old tool results between turns changes it, and the cache is written again from the first cleared result on ([tool-result-clearing](tool-result-clearing.md)).
 - `effort` and thinking settings ride in `Agent::extra`, fixed for the agent; changing them mid-session invalidates the messages cache (the reference's invalidation table).
 
 `keeps_tools_and_system_byte_identical_across_requests` compares the serialized `tools`, `system` and `model` of two requests in one tool round. The cache matches by section (tools, then system, then messages), not by the order of the JSON body's keys, which sort `messages` before `system` and `tools`; an earlier version of the test compared the bytes before `messages` and so never saw the tools, which review caught. The replay tests compare whole recorded request bodies ([messages-api-stream](messages-api-stream.md), Recorded fixtures).

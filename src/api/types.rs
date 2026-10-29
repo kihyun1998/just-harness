@@ -154,6 +154,13 @@ impl Usage {
         left.saturating_sub(self.cache_read_input_tokens.unwrap_or(0))
     }
 
+    /// The request's prompt: uncached input plus cache reads and writes.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            + self.cache_read_input_tokens.unwrap_or(0)
+            + self.cache_creation_input_tokens.unwrap_or(0)
+    }
+
     /// Adds `other` to this usage, field by field.
     pub fn add(&mut self, other: &Usage) {
         let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {

@@ -3,7 +3,8 @@
 //! The first line is `{"type":"session", ...SessionMeta}`. Each later line is
 //! `{"type":"message","message":<MessageParam>}` or
 //! `{"type":"drop","keep":<n>}`, which cuts the history back to its first `n`
-//! messages.
+//! messages, or `{"type":"clear","before":<n>}`, which clears the tool results
+//! before message `n` as [`clear_before`] does.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -16,9 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{BlockKind, ContentBlock, MessageParam, Role};
+use crate::clearing::clear_before;
 
 /// The format version written to new files; files with a higher one are refused.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The first line of a session file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,12 @@ impl SessionLog {
         self.write_line(&json!({ "type": "drop", "keep": keep }))
     }
 
+    /// Records that the history's tool results before message `before`
+    /// were cleared ([`clear_before`]).
+    pub fn record_clear(&mut self, before: usize) -> std::io::Result<()> {
+        self.write_line(&json!({ "type": "clear", "before": before }))
+    }
+
     /// Writes one line and syncs it to the disk.
     fn write_line(&mut self, line: &Value) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(line)?;
@@ -138,6 +146,12 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
             },
             Some("drop") => match record["keep"].as_u64() {
                 Some(keep) => history.truncate(keep as usize),
+                None => skipped += 1,
+            },
+            Some("clear") => match record["before"].as_u64() {
+                Some(before) => {
+                    clear_before(&mut history, before as usize);
+                }
                 None => skipped += 1,
             },
             _ => skipped += 1,

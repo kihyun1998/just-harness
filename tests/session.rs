@@ -3,6 +3,7 @@ mod support;
 use std::path::Path;
 
 use just_harness::api::{ContentBlock, MessageParam, Role};
+use just_harness::clearing::{CLEARED, clear_before};
 use just_harness::session::{
     FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, sessions_dir,
 };
@@ -37,10 +38,13 @@ fn tool_call(id: &str) -> MessageParam {
     }
 }
 
+/// Longer than the placeholder a clear puts in its place.
+const LISTING: &str = "a.txt\nb.txt\nc.txt\nd.txt\ne.txt\nf.txt\ng.txt\nh.txt\ni.txt\nj.txt\nk.txt\nl.txt\nm.txt\nn.txt\n";
+
 fn tool_result(id: &str) -> MessageParam {
     MessageParam {
         role: Role::User,
-        content: vec![ContentBlock::tool_result(id, "a.txt", false)],
+        content: vec![ContentBlock::tool_result(id, LISTING, false)],
     }
 }
 
@@ -99,6 +103,101 @@ fn a_dropped_turn_stays_dropped() {
             text(Role::User, "third")
         ]
     );
+}
+
+#[test]
+fn a_clear_is_applied_again_on_load_where_it_was_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    let mut history = vec![
+        text(Role::User, "list files"),
+        tool_call("toolu_1"),
+        tool_result("toolu_1"),
+        tool_call("toolu_2"),
+        tool_result("toolu_2"),
+        text(Role::Assistant, "Two files."),
+    ];
+    for m in &history {
+        log.append(m).unwrap();
+    }
+    clear_before(&mut history, 4);
+    log.record_clear(4).unwrap();
+    let later = vec![text(Role::User, "again"), tool_call("toolu_3")];
+    for m in &later {
+        log.append(m).unwrap();
+        history.push(m.clone());
+    }
+
+    let loaded = load(log.path()).unwrap();
+
+    assert_eq!(loaded.history[2].content[0].0["content"], CLEARED);
+    assert_eq!(loaded.history[4].content[0].0["content"], LISTING);
+    // The thinking made after the clear is kept.
+    assert_eq!(loaded.history[7].content[0].block_type(), "thinking");
+    assert_eq!(loaded.history[..8], history[..]);
+    assert_eq!(loaded.skipped, 0);
+}
+
+#[test]
+fn a_turn_dropped_after_a_clear_leaves_the_cleared_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    let mut history = vec![
+        text(Role::User, "list files"),
+        tool_call("toolu_1"),
+        tool_result("toolu_1"),
+        text(Role::Assistant, "One file."),
+    ];
+    for m in &history {
+        log.append(m).unwrap();
+    }
+    clear_before(&mut history, 3);
+    log.record_clear(3).unwrap();
+    log.append(&text(Role::User, "again")).unwrap();
+    log.append(&tool_call("toolu_2")).unwrap();
+    log.drop_to(4).unwrap();
+
+    let loaded = load(log.path()).unwrap();
+
+    assert_eq!(loaded.history, history);
+}
+
+#[test]
+fn a_second_clear_keeps_the_thinking_made_after_the_first_up_to_its_own_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    let mut history = vec![
+        text(Role::User, "list files"),
+        tool_call("toolu_1"),
+        tool_result("toolu_1"),
+        tool_call("toolu_2"),
+        tool_result("toolu_2"),
+        text(Role::Assistant, "Two files."),
+    ];
+    for m in &history {
+        log.append(m).unwrap();
+    }
+    clear_before(&mut history, 6);
+    log.record_clear(6).unwrap();
+    for m in [
+        text(Role::User, "again"),
+        tool_call("toolu_3"),
+        tool_result("toolu_3"),
+        text(Role::Assistant, "Three."),
+    ] {
+        log.append(&m).unwrap();
+        history.push(m);
+    }
+    clear_before(&mut history, 10);
+    log.record_clear(10).unwrap();
+
+    let loaded = load(log.path()).unwrap();
+
+    assert_eq!(loaded.history, history);
+    assert_eq!(loaded.history[8].content[0].0["content"], CLEARED);
+    // Made after the first clear, before the second one's change.
+    assert_eq!(loaded.history[7].content[0].block_type(), "thinking");
+    assert_eq!(loaded.history[3].content[0].block_type(), "tool_use");
 }
 
 #[test]

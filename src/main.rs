@@ -10,6 +10,7 @@ use just_harness::agent::{
     Agent, Approval, ApprovalRequest, Approver, DEFAULT_MAX_ITERATIONS, Observer, TurnEnd,
 };
 use just_harness::api::{Client, ClientConfig, ContentBlock, MessageParam, Role, Usage};
+use just_harness::clearing::{ClearPolicy, clear_before, plan};
 use just_harness::session::{
     FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, now_secs, sessions_dir,
 };
@@ -234,6 +235,10 @@ impl Log {
         self.write(|file| file.drop_to(keep));
     }
 
+    fn record_clear(&mut self, before: usize) {
+        self.write(|file| file.record_clear(before));
+    }
+
     fn write(&mut self, op: impl FnOnce(&mut SessionLog) -> std::io::Result<()>) {
         if let Log::Pending { dir, meta } = self {
             *self = match SessionLog::create(dir, meta) {
@@ -401,6 +406,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         open_session(&args.start, &sessions_dir(Path::new(&home), &cwd), &cwd)?;
     let mut allowed = HashSet::new();
     let mut cached: Option<(Usage, Instant)> = None;
+    let clearing = ClearPolicy::default();
+    // The prompt size of the last request of the last turn kept, in tokens.
+    let mut last_prompt: Option<u64> = None;
     let mut lines = input_lines();
     loop {
         print!("\n> ");
@@ -414,6 +422,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if line.trim().is_empty() {
             continue;
+        }
+        if let Some(boundary) = last_prompt.and_then(|tokens| plan(&history, &clearing, tokens)) {
+            let cleared = clear_before(&mut history, boundary);
+            log.record_clear(boundary);
+            println!(
+                "[cleared {} old tool result(s), {} bytes, and {} thinking block(s) after them]",
+                cleared.results, cleared.bytes, cleared.thinking
+            );
+            cached = None;
         }
         let before = history.len();
         let message = MessageParam {
@@ -435,7 +452,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => None,
         };
         let usages = std::mem::take(&mut terminal.usages);
+        last_prompt = usages.last().map(|(usage, _)| usage.prompt_tokens());
         let Some(result) = result else {
+            last_prompt = None;
             history.truncate(before);
             log.drop_to(before);
             println!("\n[cancelled; this request was dropped from the conversation]");
@@ -460,6 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             Err(error) => {
+                last_prompt = None;
                 history.truncate(before);
                 log.drop_to(before);
                 println!("\n[error: {error}; this request was dropped from the conversation]");

@@ -8,3 +8,4 @@ The territory map. A comment's why, trap and measured value go to a note here. N
 - [The agent loop and its tools](agent-loop.md): `src/agent.rs`, `src/tools/`, `src/main.rs`.
 - [Sessions on disk](sessions.md): `src/session.rs`, the REPL's `--continue` and `--resume`.
 - [Prompt cache](prompt-cache.md): the request shape that makes the cache hit, and the per-turn report.
+- [Clearing old tool results](tool-result-clearing.md): `src/clearing.rs`, the REPL's turn start, and the thinking it has to remove.

@@ -29,7 +29,7 @@ A reply cut at `max_tokens`, or ending with `refusal` or any stop reason other t
 
 ## History is append-only
 
-`run_turn` only pushes: the assistant message through `Message::to_param` (blocks unchanged, thinking `signature` included) and the tool-result message. Each request's `messages` starts with the previous request's, unchanged: two entries longer after a round of tool calls, one after a `pause_turn` resend. `tests/agent.rs` checks that prefix as parsed JSON. The prompt cache depends on this ([prompt-cache](prompt-cache.md)).
+`run_turn` only pushes: the assistant message through `Message::to_param` (blocks unchanged, thinking `signature` included) and the tool-result message. Each request's `messages` starts with the previous request's, unchanged: two entries longer after a round of tool calls, one after a `pause_turn` resend. `tests/agent.rs` checks that prefix as parsed JSON. The prompt cache depends on this ([prompt-cache](prompt-cache.md)). Between turns the REPL may clear old tool results, which edits earlier messages ([tool-result-clearing](tool-result-clearing.md)); `run_turn` itself never does.
 
 ## Maintainer's calls (2026-10-28, each shown with its alternative)
 
