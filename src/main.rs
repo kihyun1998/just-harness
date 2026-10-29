@@ -4,11 +4,12 @@ use std::io::Write;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use just_harness::agent::{
     Agent, Approval, ApprovalRequest, Approver, DEFAULT_MAX_ITERATIONS, Observer, TurnEnd,
 };
-use just_harness::api::{Client, ClientConfig, ContentBlock, MessageParam, Role};
+use just_harness::api::{Client, ClientConfig, ContentBlock, MessageParam, Role, Usage};
 use just_harness::session::{
     FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, now_secs, sessions_dir,
 };
@@ -16,17 +17,24 @@ use just_harness::tools::{ToolContext, ToolOutput, builtin};
 use serde_json::Value;
 
 const MODEL: &str = "claude-haiku-5-5";
-const USAGE: &str = "usage: just-harness [--max-iterations N] [--continue | --resume <id|path>]";
+const USAGE: &str =
+    "usage: just-harness [--max-iterations N] [--no-cache] [--continue | --resume <id|path>]";
 
 /// Prints the reply as it streams and one line per tool call and result, and
 /// appends each message the loop adds to the session log.
 struct Terminal<'a> {
     log: &'a mut Log,
+    /// Each request's usage in this turn, with when it ended.
+    usages: Vec<(Usage, Instant)>,
 }
 
 impl Observer for Terminal<'_> {
     fn on_message(&mut self, message: &MessageParam) {
         self.log.append(message);
+    }
+
+    fn on_usage(&mut self, usage: &Usage) {
+        self.usages.push((usage.clone(), Instant::now()));
     }
 
     fn on_event(&mut self, event: &Value) {
@@ -168,6 +176,47 @@ fn setting(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// How long a cache entry lives after the request that wrote or read it.
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Prints a turn's token usage, and the requests that read less from the
+/// cache than the request before them left there. `cached` is the last
+/// request whose cache entry can still be read.
+fn report_usage(usages: &[(Usage, Instant)], cached: &mut Option<(Usage, Instant)>, caching: bool) {
+    let mut total = Usage::default();
+    let mut misses = 0;
+    let mut missed_tokens = 0;
+    for (usage, ended) in usages {
+        total.add(usage);
+        if let Some((previous, at)) = cached.as_ref()
+            && ended.duration_since(*at) < CACHE_TTL
+        {
+            let shortfall = usage.cache_shortfall(previous);
+            if shortfall > 0 {
+                misses += 1;
+                missed_tokens += shortfall;
+            }
+        }
+        *cached = Some((usage.clone(), *ended));
+    }
+    if usages.is_empty() {
+        return;
+    }
+    println!(
+        "[tokens: {} uncached + {} from cache + {} written to cache in · {} out]",
+        total.input_tokens,
+        total.cache_read_input_tokens.unwrap_or(0),
+        total.cache_creation_input_tokens.unwrap_or(0),
+        total.output_tokens
+    );
+    if caching && misses > 0 {
+        println!(
+            "[{misses} of {} request(s) read {missed_tokens} fewer tokens from the cache than the request before left there: the prompt prefix changed]",
+            usages.len()
+        );
+    }
+}
+
 /// The session file: created with the first message, and given up after
 /// the first failed write so the file never has gaps.
 enum Log {
@@ -217,12 +266,14 @@ enum Start {
 struct Args {
     max_iterations: u32,
     start: Start,
+    cache: bool,
 }
 
 fn args() -> Result<Args, String> {
     let mut parsed = Args {
         max_iterations: DEFAULT_MAX_ITERATIONS,
         start: Start::New,
+        cache: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -235,6 +286,7 @@ fn args() -> Result<Args, String> {
                     .ok_or_else(|| format!("--max-iterations needs a positive number\n{USAGE}"))?;
             }
             "--continue" if matches!(parsed.start, Start::New) => parsed.start = Start::Continue,
+            "--no-cache" => parsed.cache = false,
             "--resume" if matches!(parsed.start, Start::New) => {
                 let target = args
                     .next()
@@ -329,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = ToolContext::new(".")?;
     let mut agent = Agent::new(Client::new(config)?, MODEL, builtin(), context);
     agent.max_iterations = args.max_iterations;
+    agent.prompt_cache = args.cache;
     agent.system = vec![ContentBlock::text(format!(
         "You are a coding agent working in the folder {}. Use the tools to search, read and edit \
          files there and to run commands. Paths are relative to that folder.",
@@ -347,6 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut log, mut history) =
         open_session(&args.start, &sessions_dir(Path::new(&home), &cwd), &cwd)?;
     let mut allowed = HashSet::new();
+    let mut cached: Option<(Usage, Instant)> = None;
     let mut lines = input_lines();
     loop {
         print!("\n> ");
@@ -368,7 +422,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         log.append(&message);
         history.push(message);
-        let mut terminal = Terminal { log: &mut log };
+        let mut terminal = Terminal {
+            log: &mut log,
+            usages: Vec::new(),
+        };
         let mut approver = Prompt {
             lines: &mut lines,
             session: &mut allowed,
@@ -377,36 +434,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result = agent.run_turn(&mut history, &mut terminal, &mut approver) => Some(result),
             _ = tokio::signal::ctrl_c() => None,
         };
+        let usages = std::mem::take(&mut terminal.usages);
         let Some(result) = result else {
             history.truncate(before);
             log.drop_to(before);
             println!("\n[cancelled; this request was dropped from the conversation]");
+            report_usage(&usages, &mut cached, args.cache);
+            cached = None;
             continue;
         };
+        let failed = result.is_err();
         match result {
-            Ok(outcome) => {
-                let usage = &outcome.last_message.usage;
-                match outcome.end {
-                    TurnEnd::StoppedByUser => {
-                        println!("\n[stopped by you after {} requests]", outcome.iterations)
-                    }
-                    TurnEnd::IterationLimit => {
-                        println!(
-                            "\n[stopped after {} requests: the iteration limit]",
-                            outcome.iterations
-                        )
-                    }
-                    TurnEnd::Stopped(reason) => println!(
-                        "\n[{reason:?} · {} requests · last: {} in / {} out tokens]",
-                        outcome.iterations, usage.input_tokens, usage.output_tokens
-                    ),
+            Ok(outcome) => match outcome.end {
+                TurnEnd::StoppedByUser => {
+                    println!("\n[stopped by you after {} requests]", outcome.iterations)
                 }
-            }
+                TurnEnd::IterationLimit => {
+                    println!(
+                        "\n[stopped after {} requests: the iteration limit]",
+                        outcome.iterations
+                    )
+                }
+                TurnEnd::Stopped(reason) => {
+                    println!("\n[{reason:?} · {} requests]", outcome.iterations)
+                }
+            },
             Err(error) => {
                 history.truncate(before);
                 log.drop_to(before);
                 println!("\n[error: {error}; this request was dropped from the conversation]");
             }
+        }
+        report_usage(&usages, &mut cached, args.cache);
+        if failed {
+            cached = None;
         }
     }
     Ok(())

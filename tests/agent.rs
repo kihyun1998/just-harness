@@ -577,3 +577,208 @@ async fn reports_the_not_run_results_of_a_stopped_turn() {
     assert_eq!(history.len(), 5);
     assert_eq!(appended.0, history[1..].to_vec());
 }
+
+#[tokio::test]
+async fn marks_the_system_prompt_and_asks_for_automatic_caching_of_the_rest() {
+    let transport = FakeTransport::new().respond(200, vec![&text_reply("ok", "end_turn")]);
+    let (mut agent, _dir) = agent(&transport, ToolSet::new());
+    agent.system = vec![
+        just_harness::api::ContentBlock::text("part one"),
+        just_harness::api::ContentBlock::text("part two"),
+    ];
+
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let body = sent_body(&transport, 0);
+    assert_eq!(body["cache_control"], json!({ "type": "ephemeral" }));
+    assert_eq!(
+        body["system"][1]["cache_control"],
+        json!({ "type": "ephemeral" })
+    );
+    assert!(body["system"][0].get("cache_control").is_none());
+    assert_eq!(body.to_string().matches("cache_control").count(), 2);
+    assert!(
+        agent.system[1].0.get("cache_control").is_none(),
+        "the agent's own system blocks stay unmarked"
+    );
+}
+
+#[tokio::test]
+async fn sends_no_cache_control_when_caching_is_off() {
+    let transport = FakeTransport::new().respond(200, vec![&text_reply("ok", "end_turn")]);
+    let (mut agent, _dir) = agent(&transport, ToolSet::new());
+    agent.system = vec![just_harness::api::ContentBlock::text("system")];
+    agent.prompt_cache = false;
+
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    assert!(
+        !sent_body(&transport, 0)
+            .to_string()
+            .contains("cache_control")
+    );
+}
+
+#[tokio::test]
+async fn keeps_tools_and_system_byte_identical_across_requests() {
+    let echo = leak(Echo::new("look", ToolOutput::ok("seen")));
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "look", json!({}))], "tool_use")],
+        )
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let (mut agent, _dir) = agent(&transport, ToolSet::new().with(echo));
+    agent.system = vec![just_harness::api::ContentBlock::text("system")];
+
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let section = |n: usize, key: &str| sent_body(&transport, n)[key].to_string();
+    assert_eq!(
+        sent_body(&transport, 0)["tools"].as_array().unwrap().len(),
+        1
+    );
+    for key in ["tools", "system", "model"] {
+        assert_eq!(
+            section(0, key),
+            section(1, key),
+            "{key} changed between requests"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sums_usage_over_the_requests_of_a_turn() {
+    use support::{message_start, sse};
+    let echo = leak(Echo::new("look", ToolOutput::ok("seen")));
+    let reply = |input: u64, read: u64, write: u64, out: u64, stop: &str| {
+        let mut start = message_start(input);
+        start = start.replace(
+            &format!("\"input_tokens\":{input}"),
+            &format!("\"input_tokens\":{input},\"cache_read_input_tokens\":{read},\"cache_creation_input_tokens\":{write}"),
+        );
+        let block = if stop == "tool_use" {
+            sse(
+                json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "toolu_1", "name": "look", "input": {} } }),
+            )
+        } else {
+            sse(
+                json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "ok" } }),
+            )
+        };
+        start
+            + &block
+            + &sse(json!({ "type": "content_block_stop", "index": 0 }))
+            + &sse(
+                json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": { "output_tokens": out } }),
+            )
+            + &sse(json!({ "type": "message_stop" }))
+    };
+    let transport = FakeTransport::new()
+        .respond(200, vec![&reply(10, 0, 1400, 30, "tool_use")])
+        .respond(200, vec![&reply(20, 1400, 50, 7, "end_turn")]);
+    let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
+
+    let outcome = agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let usage = &outcome.usage;
+    assert_eq!((usage.input_tokens, usage.output_tokens), (30, 37));
+    assert_eq!(usage.cache_read_input_tokens, Some(1400));
+    assert_eq!(usage.cache_creation_input_tokens, Some(1450));
+}
+
+/// Keeps the usage of every request the loop reports.
+#[derive(Default)]
+struct Usages(Vec<just_harness::api::Usage>);
+
+impl just_harness::agent::Observer for Usages {
+    fn on_usage(&mut self, usage: &just_harness::api::Usage) {
+        self.0.push(usage.clone());
+    }
+}
+
+#[tokio::test]
+async fn reports_the_usage_of_each_request_as_it_ends() {
+    let echo = leak(Echo::new("look", ToolOutput::ok("seen")));
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "look", json!({}))], "tool_use")],
+        )
+        .respond(500, vec!["{}"])
+        .respond(500, vec!["{}"])
+        .respond(500, vec!["{}"]);
+    let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
+    let mut usages = Usages::default();
+
+    let result = agent
+        .run_turn(&mut vec![user("go")], &mut usages, &mut AllowAll)
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        usages.0.len(),
+        1,
+        "the request that succeeded is reported even though the turn failed"
+    );
+    assert_eq!(usages.0[0].output_tokens, 5);
+}
+
+#[test]
+fn cache_shortfall_is_what_the_previous_request_left_cached_and_this_one_did_not_read() {
+    use just_harness::api::Usage;
+    let usage = |read: u64, write: u64| Usage {
+        input_tokens: 3,
+        output_tokens: 9,
+        cache_read_input_tokens: Some(read),
+        cache_creation_input_tokens: Some(write),
+    };
+
+    assert_eq!(usage(1406, 248).cache_shortfall(&usage(1342, 64)), 0);
+    assert_eq!(usage(1342, 70).cache_shortfall(&usage(1342, 64)), 64);
+    assert_eq!(usage(0, 1600).cache_shortfall(&usage(1342, 64)), 1406);
+}
+
+#[tokio::test]
+async fn never_sends_more_than_four_cache_breakpoints() {
+    let transport = FakeTransport::new().respond(200, vec![&text_reply("ok", "end_turn")]);
+    let (mut agent, _dir) = agent(&transport, ToolSet::new());
+    agent.system = vec![
+        just_harness::api::ContentBlock::text("one").with_cache_control(),
+        just_harness::api::ContentBlock::text("two").with_cache_control(),
+        just_harness::api::ContentBlock::text("three").with_cache_control(),
+        just_harness::api::ContentBlock::text("four"),
+    ];
+    let mut history = vec![just_harness::api::MessageParam {
+        role: just_harness::api::Role::User,
+        content: vec![just_harness::api::ContentBlock::text("go")],
+    }];
+
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let body = sent_body(&transport, 0);
+    assert_eq!(body.to_string().matches("cache_control").count(), 4);
+    assert_eq!(
+        body["system"][3]["cache_control"],
+        json!({ "type": "ephemeral" })
+    );
+    assert!(
+        body.get("cache_control").is_none(),
+        "no slot is left for automatic caching"
+    );
+}

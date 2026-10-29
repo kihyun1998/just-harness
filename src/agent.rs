@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::api::{
     ApiError, BlockKind, Client, ContentBlock, CreateMessageRequest, Message, MessageParam, Role,
-    StopReason, Transport,
+    StopReason, Transport, Usage,
 };
 use crate::tools::{ToolContext, ToolOutput, ToolSet};
 
@@ -19,6 +19,8 @@ pub trait Observer {
     fn on_tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
     /// A message `run_turn` appended to the history, after it was appended.
     fn on_message(&mut self, _message: &MessageParam) {}
+    /// The usage of a request that just ended.
+    fn on_usage(&mut self, _usage: &Usage) {}
 }
 
 impl Observer for () {}
@@ -75,6 +77,8 @@ pub struct TurnOutcome {
     pub end: TurnEnd,
     /// Requests sent in this turn.
     pub iterations: u32,
+    /// Token usage summed over the turn's requests.
+    pub usage: Usage,
     pub last_message: Message,
 }
 
@@ -89,6 +93,8 @@ pub struct Agent<T: Transport> {
     pub context: ToolContext,
     /// Requests one turn may send.
     pub max_iterations: u32,
+    /// Whether requests ask for prompt caching.
+    pub prompt_cache: bool,
 }
 
 impl<T: Transport> Agent<T> {
@@ -107,6 +113,7 @@ impl<T: Transport> Agent<T> {
             tools,
             context,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            prompt_cache: true,
         }
     }
 
@@ -120,6 +127,7 @@ impl<T: Transport> Agent<T> {
         approver: &mut impl Approver,
     ) -> Result<TurnOutcome, ApiError> {
         let mut iterations = 0;
+        let mut usage = Usage::default();
         let mut user_stopped = false;
         loop {
             let mut request =
@@ -127,15 +135,25 @@ impl<T: Transport> Agent<T> {
             request.system = self.system.clone();
             request.tools = self.tools.definitions();
             request.extra = self.extra.clone();
+            if self.prompt_cache {
+                add_cache_breakpoints(&mut request);
+            }
             let message = self.client.send(&request, |e| observer.on_event(e)).await?;
             iterations += 1;
+            usage.add(&message.usage);
+            observer.on_usage(&message.usage);
             append(history, observer, message.to_param());
 
             if user_stopped {
                 if let Some(not_run) = not_run_results(&message, USER_STOPPED) {
                     append(history, observer, not_run);
                 }
-                return Ok(outcome(TurnEnd::StoppedByUser, iterations, message));
+                return Ok(outcome(
+                    TurnEnd::StoppedByUser,
+                    iterations,
+                    usage.clone(),
+                    message,
+                ));
             }
             let stopped = TurnEnd::Stopped(message.stop_reason.clone());
             match next_step(message.stop_reason.as_ref()) {
@@ -144,7 +162,7 @@ impl<T: Transport> Agent<T> {
                     if let Some(not_run) = not_run_results(&message, &why) {
                         append(history, observer, not_run);
                     }
-                    return Ok(outcome(stopped, iterations, message));
+                    return Ok(outcome(stopped, iterations, usage.clone(), message));
                 }
                 Step::Resume => {}
                 Step::RunTools => match self.run_tools(&message, observer, approver).await {
@@ -152,11 +170,16 @@ impl<T: Transport> Agent<T> {
                         append(history, observer, results);
                         user_stopped = stop;
                     }
-                    None => return Ok(outcome(stopped, iterations, message)),
+                    None => return Ok(outcome(stopped, iterations, usage.clone(), message)),
                 },
             }
             if !user_stopped && iterations >= self.max_iterations {
-                return Ok(outcome(TurnEnd::IterationLimit, iterations, message));
+                return Ok(outcome(
+                    TurnEnd::IterationLimit,
+                    iterations,
+                    usage.clone(),
+                    message,
+                ));
             }
         }
     }
@@ -233,6 +256,42 @@ fn stop_reason_name(message: &Message) -> String {
         .unwrap_or_else(|| "no stop reason".into())
 }
 
+/// The most `cache_control` breakpoints one request may carry.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// Marks the last system block and asks for automatic caching, within the
+/// breakpoint limit and counting the markers the request already has.
+fn add_cache_breakpoints(request: &mut CreateMessageRequest) {
+    let marked = |block: &ContentBlock| block.0.get("cache_control").is_some();
+    let mut count = request
+        .tools
+        .iter()
+        .filter(|t| t.cache_control.is_some())
+        .count()
+        + request.system.iter().filter(|b| marked(b)).count()
+        + request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| marked(b))
+            .count();
+    if count < MAX_CACHE_BREAKPOINTS
+        && let Some(last) = request.system.pop()
+    {
+        if !marked(&last) {
+            count += 1;
+        }
+        request.system.push(if marked(&last) {
+            last
+        } else {
+            last.with_cache_control()
+        });
+    }
+    if count < MAX_CACHE_BREAKPOINTS {
+        request.cache_control = Some(serde_json::json!({ "type": "ephemeral" }));
+    }
+}
+
 /// One `is_error` result per tool call in `message`, saying it was not run
 /// because of `why`. `None` when the message has no tool calls.
 fn not_run_results(message: &Message, why: &str) -> Option<MessageParam> {
@@ -260,10 +319,11 @@ fn append(history: &mut Vec<MessageParam>, observer: &mut impl Observer, message
     }
 }
 
-fn outcome(end: TurnEnd, iterations: u32, last_message: Message) -> TurnOutcome {
+fn outcome(end: TurnEnd, iterations: u32, usage: Usage, last_message: Message) -> TurnOutcome {
     TurnOutcome {
         end,
         iterations,
+        usage,
         last_message,
     }
 }

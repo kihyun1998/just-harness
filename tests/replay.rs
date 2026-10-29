@@ -44,6 +44,7 @@ fn request_from(recorded: &Value) -> CreateMessageRequest {
         serde_json::from_value(recorded.get("system").cloned().unwrap_or(json!([]))).unwrap();
     request.tools =
         serde_json::from_value(recorded.get("tools").cloned().unwrap_or(json!([]))).unwrap();
+    request.cache_control = recorded.get("cache_control").cloned();
     request.extra = extra_fields(recorded);
     request
 }
@@ -57,6 +58,7 @@ fn extra_fields(recorded: &Value) -> Map<String, Value> {
         "system",
         "tools",
         "stream",
+        "cache_control",
     ];
     recorded
         .as_object()
@@ -82,7 +84,17 @@ fn agent_from<'t>(
         ToolContext::new(dir).unwrap(),
     );
     agent.max_tokens = first.max_tokens;
-    agent.system = first.system;
+    agent.prompt_cache = first.cache_control.is_some();
+    agent.system = first
+        .system
+        .into_iter()
+        .map(|mut block| {
+            if let Some(object) = block.0.as_object_mut() {
+                object.remove("cache_control");
+            }
+            block
+        })
+        .collect();
     agent.extra = first.extra;
     (agent, first.messages)
 }
@@ -192,6 +204,26 @@ async fn the_recorded_tool_loop_runs_its_calls_through_the_real_tools() {
             .all(|b| b.0.get("is_error").is_none())
     );
     assert_eq!(history.len(), 2 * recorded);
+    let recorded_usage = |field: &str| -> u64 {
+        (1..=recorded)
+            .flat_map(|n| plain_events("tool-loop", n))
+            .filter(|e| e["type"] == "message_start")
+            .map(|e| e["message"]["usage"][field].as_u64().unwrap_or(0))
+            .sum()
+    };
+    assert!(
+        recorded_usage("cache_read_input_tokens") > 0,
+        "the recorded loop should read from the cache"
+    );
+    assert_eq!(
+        outcome.usage.cache_read_input_tokens,
+        Some(recorded_usage("cache_read_input_tokens"))
+    );
+    assert_eq!(
+        outcome.usage.cache_creation_input_tokens,
+        Some(recorded_usage("cache_creation_input_tokens"))
+    );
+    assert_eq!(outcome.usage.input_tokens, recorded_usage("input_tokens"));
 }
 
 #[tokio::test]

@@ -1,4 +1,7 @@
 {
+  "cache_control": {
+    "type": "ephemeral"
+  },
   "max_tokens": 64000,
   "messages": [
     {
@@ -16,7 +19,7 @@
           "caller": {
             "type": "direct"
           },
-          "id": "toolu_016DWkfLUNao1iAae8RodvbK",
+          "id": "toolu_019NuG5k8PMwvdqYnrJdZuBK",
           "input": {
             "path": "hello.txt"
           },
@@ -30,7 +33,7 @@
       "content": [
         {
           "content": "     1\thello world",
-          "tool_use_id": "toolu_016DWkfLUNao1iAae8RodvbK",
+          "tool_use_id": "toolu_019NuG5k8PMwvdqYnrJdZuBK",
           "type": "tool_result"
         }
       ],
@@ -44,6 +47,9 @@
   "stream": true,
   "system": [
     {
+      "cache_control": {
+        "type": "ephemeral"
+      },
       "text": "You are a coding agent working in a folder. Use the tools to search, read and edit files there and to run commands. Paths are relative to that folder.",
       "type": "text"
     }

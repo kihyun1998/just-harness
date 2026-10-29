@@ -98,6 +98,10 @@ pub struct CreateMessageRequest {
     pub messages: Vec<MessageParam>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+    /// Top-level `cache_control`: automatic caching, which places a cache
+    /// breakpoint on the last cacheable block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<Value>,
     /// Further top-level request fields, sent as given.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -111,6 +115,7 @@ impl CreateMessageRequest {
             system: Vec::new(),
             messages,
             tools: Vec::new(),
+            cache_control: None,
             extra: Map::new(),
         }
     }
@@ -138,6 +143,32 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Tokens the previous request left in the cache, read or written,
+    /// that this request did not read.
+    pub fn cache_shortfall(&self, previous: &Usage) -> u64 {
+        let left = previous.cache_read_input_tokens.unwrap_or(0)
+            + previous.cache_creation_input_tokens.unwrap_or(0);
+        left.saturating_sub(self.cache_read_input_tokens.unwrap_or(0))
+    }
+
+    /// Adds `other` to this usage, field by field.
+    pub fn add(&mut self, other: &Usage) {
+        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens = sum(
+            self.cache_creation_input_tokens,
+            other.cache_creation_input_tokens,
+        );
+        self.cache_read_input_tokens =
+            sum(self.cache_read_input_tokens, other.cache_read_input_tokens);
+    }
 }
 
 /// A complete assistant message, assembled from a stream.

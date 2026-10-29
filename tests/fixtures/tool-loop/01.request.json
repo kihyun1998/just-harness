@@ -1,4 +1,7 @@
 {
+  "cache_control": {
+    "type": "ephemeral"
+  },
   "max_tokens": 64000,
   "messages": [
     {
@@ -18,6 +21,9 @@
   "stream": true,
   "system": [
     {
+      "cache_control": {
+        "type": "ephemeral"
+      },
       "text": "You are a coding agent working in a folder. Use the tools to search, read and edit files there and to run commands. Paths are relative to that folder.",
       "type": "text"
     }

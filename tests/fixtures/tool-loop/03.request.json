@@ -1,4 +1,7 @@
 {
+  "cache_control": {
+    "type": "ephemeral"
+  },
   "max_tokens": 64000,
   "messages": [
     {
@@ -16,7 +19,7 @@
           "caller": {
             "type": "direct"
           },
-          "id": "toolu_016DWkfLUNao1iAae8RodvbK",
+          "id": "toolu_019NuG5k8PMwvdqYnrJdZuBK",
           "input": {
             "path": "hello.txt"
           },
@@ -30,7 +33,7 @@
       "content": [
         {
           "content": "     1\thello world",
-          "tool_use_id": "toolu_016DWkfLUNao1iAae8RodvbK",
+          "tool_use_id": "toolu_019NuG5k8PMwvdqYnrJdZuBK",
           "type": "tool_result"
         }
       ],
@@ -42,7 +45,7 @@
           "caller": {
             "type": "direct"
           },
-          "id": "toolu_01R6kE3EbdQ6Y8JMPPLZ6CZu",
+          "id": "toolu_01F7VmzcysL3DzUa7h6BAWqL",
           "input": {
             "new_string": "hello harness",
             "old_string": "hello world",
@@ -55,7 +58,7 @@
           "caller": {
             "type": "direct"
           },
-          "id": "toolu_01NBKm2SsNo1HobNQZkJuqkz",
+          "id": "toolu_01SmrckXGBnqHDPCj9yRxgf1",
           "input": {
             "command": "cat hello.txt"
           },
@@ -69,12 +72,12 @@
       "content": [
         {
           "content": "Edited hello.txt (1 lines -> 1 lines)",
-          "tool_use_id": "toolu_01R6kE3EbdQ6Y8JMPPLZ6CZu",
+          "tool_use_id": "toolu_01F7VmzcysL3DzUa7h6BAWqL",
           "type": "tool_result"
         },
         {
           "content": "exit code: 0\n--- stdout ---\nhello harness",
-          "tool_use_id": "toolu_01NBKm2SsNo1HobNQZkJuqkz",
+          "tool_use_id": "toolu_01SmrckXGBnqHDPCj9yRxgf1",
           "type": "tool_result"
         }
       ],
@@ -88,6 +91,9 @@
   "stream": true,
   "system": [
     {
+      "cache_control": {
+        "type": "ephemeral"
+      },
       "text": "You are a coding agent working in a folder. Use the tools to search, read and edit files there and to run commands. Paths are relative to that folder.",
       "type": "text"
     }
