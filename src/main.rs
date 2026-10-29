@@ -20,8 +20,8 @@ use just_harness::compaction::{
 };
 use just_harness::memory::{INDEX_MAX_BYTES, INDEX_MAX_LINES, Settings, load_context, memory_dir};
 use just_harness::session::{
-    FORMAT_VERSION, Prompt as SessionPrompt, SessionLog, SessionMeta, latest, load, new_id,
-    now_secs, sessions_dir,
+    FORMAT_VERSION, Prompt as SessionPrompt, SessionLog, SessionMeta, find_by_id, latest, load,
+    new_id, now_secs, sessions_dir, sessions_root,
 };
 use just_harness::tools::{ToolContext, ToolOutput, builtin};
 use serde_json::Value;
@@ -462,6 +462,7 @@ fn args() -> Result<Args, String> {
 /// and the folder a resumed session last ran in when that is not `cwd`.
 fn open_session(
     start: &Start,
+    root: &Path,
     dir: &Path,
     cwd: &Path,
     current: &SessionPrompt,
@@ -493,18 +494,18 @@ fn open_session(
                 None,
             ));
         }
-        Start::Continue => latest(dir, &cwd_text)
-            .map_err(|e| format!("{}: {}", shown(dir), printable(&e.to_string())))?
+        Start::Continue => latest(root, &cwd_text)
+            .map_err(|e| format!("{}: {}", shown(root), printable(&e.to_string())))?
             .ok_or_else(|| {
                 format!(
-                    "no session to continue for this folder (looked in {})",
-                    shown(dir)
+                    "no session to continue for this folder (looked under {})",
+                    shown(root)
                 )
             })?,
         Start::Resume(target) if target.contains('/') || target.ends_with(".jsonl") => {
             PathBuf::from(target)
         }
-        Start::Resume(id) => dir.join(format!("{id}.jsonl")),
+        Start::Resume(id) => find_by_id(root, dir, id).map_err(|e| printable(&e))?,
     };
     let fail = |e: std::io::Error| printable(&e.to_string());
     let loaded = load(&path).map_err(fail)?;
@@ -598,8 +599,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Type a request. Ctrl-C cancels a running request; Ctrl-C or Ctrl-D at the prompt quits."
     );
-    let (mut log, mut history, prompt, mut moved_from) =
-        open_session(&args.start, &sessions_dir(&home, &cwd), &cwd, &current)?;
+    let (mut log, mut history, prompt, mut moved_from) = open_session(
+        &args.start,
+        &sessions_root(&home),
+        &sessions_dir(&home, &cwd),
+        &cwd,
+        &current,
+    )?;
     use_prompt(&mut agent, &prompt, &current);
     // Whether the next turn starts by carrying the instruction files and the
     // memory index: in a new session, and after a compaction.

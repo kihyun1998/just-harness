@@ -6,7 +6,7 @@ use just_harness::api::{ContentBlock, MessageParam, Role};
 use just_harness::clearing::{CLEARED, clear_before};
 use just_harness::compaction::compacted;
 use just_harness::session::{
-    FORMAT_VERSION, Prompt, SessionLog, SessionMeta, latest, load, new_id, sessions_dir,
+    FORMAT_VERSION, Prompt, SessionLog, SessionMeta, find_by_id, latest, load, new_id, sessions_dir,
 };
 use serde_json::json;
 
@@ -340,37 +340,121 @@ fn sessions_are_kept_per_working_folder_under_home() {
 
 #[test]
 fn latest_is_the_most_recently_written_session_of_this_folder() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_eq!(latest(dir.path(), "/work/project").unwrap(), None);
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(latest(root.path(), "/work/project").unwrap(), None);
     let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
     let mut other = meta("other");
     other.cwd = "/work-project".into();
+    let dir = root.path().join("-work-project");
     for (m, age_secs) in [
         (meta("a"), 300),
         (meta("b"), 600),
         (meta("c"), 0),
         (other, 0),
     ] {
-        let mut log = SessionLog::create(dir.path(), &m).unwrap();
+        let mut log = SessionLog::create(&dir, &m).unwrap();
         log.append(&text(Role::User, "hi")).unwrap();
-        let file = std::fs::File::options()
-            .write(true)
-            .open(log.path())
-            .unwrap();
-        file.set_modified(base - std::time::Duration::from_secs(age_secs))
-            .unwrap();
+        age(log.path(), base, age_secs);
     }
-    std::fs::write(dir.path().join("notes.txt"), "not a session").unwrap();
-    std::fs::write(dir.path().join("broken.jsonl"), "not json\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "not a session").unwrap();
+    std::fs::write(dir.join("broken.jsonl"), "not json\n").unwrap();
+    std::fs::write(root.path().join("stray.jsonl"), "not in a folder\n").unwrap();
 
     assert_eq!(
-        latest(dir.path(), "/work/project").unwrap(),
-        Some(dir.path().join("c.jsonl"))
+        latest(root.path(), "/work/project").unwrap(),
+        Some(dir.join("c.jsonl"))
     );
     assert_eq!(
-        latest(dir.path(), "/work-project").unwrap(),
-        Some(dir.path().join("other.jsonl"))
+        latest(root.path(), "/work-project").unwrap(),
+        Some(dir.join("other.jsonl"))
     );
+}
+
+fn age(path: &Path, base: std::time::SystemTime, secs: u64) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(base - std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
+#[test]
+fn latest_goes_by_the_folder_a_session_last_ran_in() {
+    let root = tempfile::tempdir().unwrap();
+    let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let started_a = root.path().join("-work-a");
+    let mut stayed = SessionLog::create(&started_a, &meta("stayed")).unwrap();
+    stayed.append(&text(Role::User, "hi")).unwrap();
+    age(stayed.path(), base, 600);
+    let mut moved = SessionLog::create(&started_a, &meta("moved")).unwrap();
+    moved.append(&text(Role::User, "hi")).unwrap();
+    moved.record_cwd("/work/b").unwrap();
+    age(moved.path(), base, 0);
+
+    assert_eq!(
+        latest(root.path(), "/work/b").unwrap(),
+        Some(started_a.join("moved.jsonl"))
+    );
+    assert_eq!(
+        latest(root.path(), "/work/project").unwrap(),
+        Some(started_a.join("stayed.jsonl"))
+    );
+
+    // The newest match wins across folders.
+    let mut later = SessionLog::create(&root.path().join("-work-b"), &{
+        let mut m = meta("later");
+        m.cwd = "/work/b".into();
+        m
+    })
+    .unwrap();
+    later.append(&text(Role::User, "hi")).unwrap();
+    age(later.path(), base, 0);
+    age(moved.path(), base, 300);
+    assert_eq!(
+        latest(root.path(), "/work/b").unwrap(),
+        Some(root.path().join("-work-b/later.jsonl"))
+    );
+    assert_eq!(
+        latest(&root.path().join("missing"), "/work/b").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn an_id_is_found_here_first_then_in_exactly_one_other_folder() {
+    let root = tempfile::tempdir().unwrap();
+    let here = root.path().join("-work-here");
+    let elsewhere = root.path().join("-work-elsewhere");
+    let third = root.path().join("-work-third");
+    for (dir, id) in [
+        (&here, "s1"),
+        (&elsewhere, "s1"),
+        (&elsewhere, "s2"),
+        (&third, "s3"),
+        (&elsewhere, "s3"),
+    ] {
+        let mut log = SessionLog::create(dir, &meta(id)).unwrap();
+        log.append(&text(Role::User, "hi")).unwrap();
+    }
+    SessionLog::create(&here, &meta("s4")).unwrap();
+    let mut s4 = SessionLog::create(&elsewhere, &meta("s4")).unwrap();
+    s4.append(&text(Role::User, "hi")).unwrap();
+
+    assert_eq!(
+        find_by_id(root.path(), &here, "s1"),
+        Ok(here.join("s1.jsonl"))
+    );
+    assert_eq!(
+        find_by_id(root.path(), &here, "s2"),
+        Ok(elsewhere.join("s2.jsonl"))
+    );
+    let two = find_by_id(root.path(), &here, "s3").unwrap_err();
+    assert!(two.starts_with("2 sessions named s3"), "{two}");
+    // A file with no messages does not count.
+    assert_eq!(
+        find_by_id(root.path(), &here, "s4"),
+        Ok(elsewhere.join("s4.jsonl"))
+    );
+    let none = find_by_id(root.path(), &here, "s9").unwrap_err();
+    assert!(none.contains("s9"), "{none}");
 }
 
 #[test]
@@ -552,4 +636,16 @@ fn the_folder_a_session_runs_in_is_its_meta_folder_until_a_move_is_recorded() {
     assert_eq!(loaded.meta.cwd, "/work/project");
     assert_eq!(loaded.history.len(), 2);
     assert_eq!(loaded.skipped, 0);
+}
+
+#[test]
+fn a_sessions_folder_that_cannot_be_read_is_an_error_for_continue() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let locked = root.path().join("sessions");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = latest(&locked, "/work/project");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
 }

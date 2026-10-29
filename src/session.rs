@@ -299,9 +299,12 @@ fn invalid(path: &Path, why: &str) -> std::io::Error {
 /// The folder holding the sessions of working folder `cwd`, under `home`:
 /// `<home>/.just-harness/sessions/<cwd with each / as ->`.
 pub fn sessions_dir(home: &Path, cwd: &Path) -> PathBuf {
-    home.join(".just-harness")
-        .join("sessions")
-        .join(folder_slug(cwd))
+    sessions_root(home).join(folder_slug(cwd))
+}
+
+/// The folder that holds every working folder's session folder.
+pub fn sessions_root(home: &Path) -> PathBuf {
+    home.join(".just-harness").join("sessions")
 }
 
 /// `cwd` as one folder name: each `/` as `-`.
@@ -309,35 +312,66 @@ pub fn folder_slug(cwd: &Path) -> String {
     cwd.to_string_lossy().replace('/', "-")
 }
 
-/// The most recently modified session file in `dir` whose meta names `cwd`.
-/// Entries that cannot be read, and files that are not sessions, are skipped.
-pub fn latest(dir: &Path, cwd: &str) -> std::io::Result<Option<PathBuf>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+/// The session file of `id`: in the session folder `here` when a session
+/// with messages is there, else in the one other folder under `root` that
+/// holds one.
+pub fn find_by_id(root: &Path, here: &Path, id: &str) -> Result<PathBuf, String> {
+    let name = format!("{id}.jsonl");
+    if has_messages(&here.join(&name)) {
+        return Ok(here.join(name));
+    }
+    let found: Vec<PathBuf> = session_folders(root)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|dir| dir.join(&name))
+        .filter(|path| has_messages(path))
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("no session {id} under {}", root.display())),
+        many => Err(format!(
+            "{} sessions named {id} under {}; resume one by its path",
+            many.len(),
+            root.display()
+        )),
+    }
+}
+
+/// The most recently modified session file under `root` whose session last
+/// ran in `cwd` ([`Loaded::cwd`]). Files that cannot be read or loaded, and
+/// files that are not sessions, are skipped; a `root` that cannot be read
+/// is an error, one that does not exist means none.
+pub fn latest(root: &Path, cwd: &str) -> std::io::Result<Option<PathBuf>> {
+    let folders = match session_folders(root) {
+        Ok(folders) => folders,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|x| x != "jsonl") {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if newest.as_ref().is_some_and(|(t, _)| modified <= *t) {
-            continue;
-        }
-        let first = File::open(&path)
-            .ok()
-            .and_then(|f| BufReader::new(f).lines().next())
-            .and_then(Result::ok);
-        if read_meta(&path, first).is_ok_and(|meta| meta.cwd == cwd) {
-            newest = Some((modified, path));
-        }
-    }
-    Ok(newest.map(|(_, path)| path))
+    let mut files: Vec<(SystemTime, PathBuf)> = folders
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| entry.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    files.sort_by(|a, b| b.cmp(a));
+    Ok(files
+        .into_iter()
+        .map(|(_, path)| path)
+        .find(|path| load(path).is_ok_and(|loaded| loaded.cwd == cwd)))
+}
+
+/// The entries directly under `root`; files among them hold no sessions.
+fn session_folders(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(std::fs::read_dir(root)?
+        .flatten()
+        .map(|e| e.path())
+        .collect())
+}
+
+/// Whether `path` is a session file with at least one message.
+fn has_messages(path: &Path) -> bool {
+    path.is_file() && load(path).is_ok_and(|loaded| !loaded.history.is_empty())
 }
 
 /// Seconds since the Unix epoch.
