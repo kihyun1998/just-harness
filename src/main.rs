@@ -227,6 +227,27 @@ fn report_usage(usages: &[(Usage, Instant)], cached: &mut Option<(Usage, Instant
     }
 }
 
+/// The message telling the model that a session that ran in `from` now
+/// runs in `cwd`, with the memory folder this run has, if any.
+fn folder_note(from: &str, cwd: &Path, memory: Option<&Path>) -> MessageParam {
+    let memory = match memory {
+        Some(dir) => format!(
+            "Your memory folder is {dir}; read and write memory there.",
+            dir = dir.display()
+        ),
+        None => "There is no memory folder in this run.".into(),
+    };
+    MessageParam {
+        role: Role::User,
+        content: vec![ContentBlock::text(format!(
+            "<working-folder>\nThis session now continues in the working folder {cwd}, not {from} \
+             where it ran before. Paths are relative to {cwd}, and the file tools work there, \
+             not in {from}. {memory}\n</working-folder>",
+            cwd = cwd.display(),
+        ))],
+    }
+}
+
 /// Makes `agent` send `prompt`; its tool definitions replace the tool
 /// set's only when they differ from `current`'s.
 fn use_prompt<T: Transport>(agent: &mut Agent<T>, prompt: &SessionPrompt, current: &SessionPrompt) {
@@ -352,6 +373,10 @@ impl Log {
         self.write(|file| file.drop_to(keep));
     }
 
+    fn record_cwd(&mut self, cwd: &str) {
+        self.write(|file| file.record_cwd(cwd));
+    }
+
     fn record_prompt(&mut self, prompt: &SessionPrompt) {
         self.write(|file| file.record_prompt(prompt));
     }
@@ -432,14 +457,15 @@ fn args() -> Result<Args, String> {
     Ok(parsed)
 }
 
-/// The session to write to, the history to start from, and the prompt its
-/// requests carry: the one recorded in a resumed session, else `current`.
+/// The session to write to, the history to start from, the prompt its
+/// requests carry (the one recorded in a resumed session, else `current`),
+/// and the folder a resumed session last ran in when that is not `cwd`.
 fn open_session(
     start: &Start,
     dir: &Path,
     cwd: &Path,
     current: &SessionPrompt,
-) -> Result<(Log, Vec<MessageParam>, SessionPrompt), String> {
+) -> Result<(Log, Vec<MessageParam>, SessionPrompt, Option<String>), String> {
     let cwd_text = cwd.display().to_string();
     let shown = |path: &Path| printable(&path.display().to_string());
     let path = match start {
@@ -464,6 +490,7 @@ fn open_session(
                 },
                 Vec::new(),
                 current.clone(),
+                None,
             ));
         }
         Start::Continue => latest(dir, &cwd_text)
@@ -487,10 +514,11 @@ fn open_session(
             loaded.skipped
         );
     }
-    if loaded.meta.cwd != cwd_text {
+    let moved_from = (loaded.cwd != cwd_text).then(|| loaded.cwd.clone());
+    if let Some(from) = &moved_from {
         println!(
-            "[this session ran in {}; tools now work in {}]",
-            printable(&loaded.meta.cwd),
+            "[this session ran in {}; tools now work in {}, and the model is told so]",
+            printable(from),
             printable(&cwd_text)
         );
     }
@@ -528,7 +556,7 @@ fn open_session(
         printable(&loaded.meta.id),
         loaded.history.len()
     );
-    Ok((Log::Open(file), loaded.history, prompt))
+    Ok((Log::Open(file), loaded.history, prompt, moved_from))
 }
 
 #[tokio::main]
@@ -570,7 +598,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Type a request. Ctrl-C cancels a running request; Ctrl-C or Ctrl-D at the prompt quits."
     );
-    let (mut log, mut history, prompt) =
+    let (mut log, mut history, prompt, mut moved_from) =
         open_session(&args.start, &sessions_dir(&home, &cwd), &cwd, &current)?;
     use_prompt(&mut agent, &prompt, &current);
     // Whether the next turn starts by carrying the instruction files and the
@@ -639,6 +667,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log.append(&message);
                 history.push(message);
             }
+        }
+        if let Some(from) = moved_from.take() {
+            let note = folder_note(&from, &cwd, memory.as_deref());
+            log.append(&note);
+            history.push(note);
+            log.record_cwd(&cwd.display().to_string());
         }
         let before = history.len();
         let message = MessageParam {

@@ -537,3 +537,19 @@ fn a_session_with_no_recorded_prompt_says_so() {
     log.append(&text(Role::User, "hi")).unwrap();
     assert_eq!(load(log.path()).unwrap().prompt, None);
 }
+
+#[test]
+fn the_folder_a_session_runs_in_is_its_meta_folder_until_a_move_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    log.append(&text(Role::User, "hi")).unwrap();
+    assert_eq!(load(log.path()).unwrap().cwd, "/work/project");
+
+    log.record_cwd("/work/other").unwrap();
+    log.append(&text(Role::User, "again")).unwrap();
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(loaded.cwd, "/work/other");
+    assert_eq!(loaded.meta.cwd, "/work/project");
+    assert_eq!(loaded.history.len(), 2);
+    assert_eq!(loaded.skipped, 0);
+}

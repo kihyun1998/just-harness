@@ -7,7 +7,8 @@
 //! before message `n` as [`clear_before`] does, or
 //! `{"type":"compact","summary":<text>}`, which replaces the history with
 //! [`compacted`]`(summary)`, or `{"type":"prompt",...Prompt}`, the system
-//! prompt and tool definitions the requests carry from there on.
+//! prompt and tool definitions the requests carry from there on, or
+//! `{"type":"cwd","cwd":<folder>}`, the working folder it runs in from there on.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -24,7 +25,7 @@ use crate::clearing::clear_before;
 use crate::compaction::compacted;
 
 /// The format version written to new files; files with a higher one are refused.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The first line of a session file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +113,11 @@ impl SessionLog {
         self.write_line(&json!({ "type": "compact", "summary": summary }))
     }
 
+    /// Records that the session runs in the working folder `cwd` from here on.
+    pub fn record_cwd(&mut self, cwd: &str) -> std::io::Result<()> {
+        self.write_line(&json!({ "type": "cwd", "cwd": cwd }))
+    }
+
     /// Records the prompt the session's requests carry from here on.
     pub fn record_prompt(&mut self, prompt: &Prompt) -> std::io::Result<()> {
         let mut line = serde_json::to_value(prompt)?;
@@ -144,6 +150,9 @@ pub struct Loaded {
     pub repair: Option<MessageParam>,
     /// The last prompt recorded; `None` for a file that records none.
     pub prompt: Option<Prompt>,
+    /// The working folder the session last ran in: the last one recorded,
+    /// else the meta's.
+    pub cwd: String,
 }
 
 /// Reads a session file. The first line must be the session's meta, of this
@@ -155,6 +164,7 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
 
     let mut history: Vec<MessageParam> = Vec::new();
     let mut prompt = None;
+    let mut cwd = None;
     let mut skipped = 0;
     for line in lines {
         let line = line?;
@@ -172,6 +182,10 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
             },
             Some("drop") => match record["keep"].as_u64() {
                 Some(keep) => history.truncate(keep as usize),
+                None => skipped += 1,
+            },
+            Some("cwd") => match record["cwd"].as_str() {
+                Some(moved) => cwd = Some(moved.to_string()),
                 None => skipped += 1,
             },
             Some("prompt") => match serde_json::from_value(record.clone()) {
@@ -200,12 +214,13 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
         history.push(repair.clone());
     }
     Ok(Loaded {
-        meta,
         history,
         skipped,
         cut_at,
         repair,
         prompt,
+        cwd: cwd.unwrap_or_else(|| meta.cwd.clone()),
+        meta,
     })
 }
 
