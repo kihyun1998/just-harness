@@ -6,7 +6,7 @@ use just_harness::api::{ContentBlock, MessageParam, Role};
 use just_harness::clearing::{CLEARED, clear_before};
 use just_harness::compaction::compacted;
 use just_harness::session::{
-    FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, sessions_dir,
+    FORMAT_VERSION, Prompt, SessionLog, SessionMeta, latest, load, new_id, sessions_dir,
 };
 use serde_json::json;
 
@@ -496,4 +496,44 @@ fn appending_after_a_cut_last_line_starts_a_new_line() {
             text(Role::User, "after the crash")
         ]
     );
+}
+
+fn prompt(text: &str) -> Prompt {
+    Prompt {
+        system: vec![ContentBlock::text(text)],
+        tools: vec![just_harness::api::Tool {
+            name: "read_file".into(),
+            description: format!("Reads a file. {text}"),
+            input_schema: json!({ "type": "object" }),
+            cache_control: None,
+        }],
+    }
+}
+
+#[test]
+fn the_last_recorded_prompt_comes_back_and_a_compaction_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    log.record_prompt(&prompt("first")).unwrap();
+    log.append(&text(Role::User, "hi")).unwrap();
+    log.append(&text(Role::Assistant, "hello")).unwrap();
+    assert_eq!(load(log.path()).unwrap().prompt, Some(prompt("first")));
+
+    log.record_compact("Said hello.").unwrap();
+    assert_eq!(load(log.path()).unwrap().prompt, Some(prompt("first")));
+    log.record_prompt(&prompt("second")).unwrap();
+    log.append(&text(Role::User, "again")).unwrap();
+
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(loaded.prompt, Some(prompt("second")));
+    assert_eq!(loaded.history.len(), 2);
+    assert_eq!(loaded.skipped, 0);
+}
+
+#[test]
+fn a_session_with_no_recorded_prompt_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s1")).unwrap();
+    log.append(&text(Role::User, "hi")).unwrap();
+    assert_eq!(load(log.path()).unwrap().prompt, None);
 }

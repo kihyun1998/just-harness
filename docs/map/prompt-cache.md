@@ -12,7 +12,7 @@ Maintainer's call (2026-10-29, shown with 1 hour and its 2x write): the 5-minute
 
 ## What keeps the prefix byte-stable
 
-- The system prompt is fixed text plus the working folder and the memory folder ([memory](memory.md)), nothing time-dependent; the tool list is `builtin()` in a fixed order with descriptions built from constants.
+- The system prompt is fixed text plus the working folder and the memory folder ([memory](memory.md)), nothing time-dependent, and a resumed session keeps the one it recorded until its next compaction ([sessions](sessions.md)); the tool list is `builtin()` in a fixed order with descriptions built from constants.
 - serde_json is built without `preserve_order`, so JSON objects serialize with sorted keys (`cargo tree -e features -i serde_json`, 2026-10-29).
 - History is append-only within a turn ([agent-loop](agent-loop.md)), so each request's `messages` starts with the previous request's. Clearing old tool results between turns changes it, and the cache is written again from the first cleared result on ([tool-result-clearing](tool-result-clearing.md)); a compaction starts the messages over ([compaction](compaction.md)).
 - `effort` and thinking settings ride in `Agent::extra`, fixed for the agent; changing them mid-session invalidates the messages cache (the reference's invalidation table).

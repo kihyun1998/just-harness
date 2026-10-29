@@ -95,6 +95,9 @@ pub struct Agent<T: Transport> {
     pub max_iterations: u32,
     /// Whether requests ask for prompt caching.
     pub prompt_cache: bool,
+    /// Tool definitions sent in place of `tools`' own; calls still run
+    /// through `tools`.
+    pub tool_definitions: Option<Vec<crate::api::Tool>>,
 }
 
 impl<T: Transport> Agent<T> {
@@ -114,6 +117,7 @@ impl<T: Transport> Agent<T> {
             context,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             prompt_cache: true,
+            tool_definitions: None,
         }
     }
 
@@ -185,7 +189,10 @@ impl<T: Transport> Agent<T> {
     ) -> Result<Message, ApiError> {
         let mut request = CreateMessageRequest::new(&self.model, self.max_tokens, messages);
         request.system = self.system.clone();
-        request.tools = self.tools.definitions();
+        request.tools = match &self.tool_definitions {
+            Some(definitions) => definitions.clone(),
+            None => self.tools.definitions(),
+        };
         request.extra = self.extra.clone();
         if self.prompt_cache {
             add_cache_breakpoints(&mut request);

@@ -20,7 +20,8 @@ use just_harness::compaction::{
 };
 use just_harness::memory::{INDEX_MAX_BYTES, INDEX_MAX_LINES, Settings, load_context, memory_dir};
 use just_harness::session::{
-    FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, now_secs, sessions_dir,
+    FORMAT_VERSION, Prompt as SessionPrompt, SessionLog, SessionMeta, latest, load, new_id,
+    now_secs, sessions_dir,
 };
 use just_harness::tools::{ToolContext, ToolOutput, builtin};
 use serde_json::Value;
@@ -226,6 +227,13 @@ fn report_usage(usages: &[(Usage, Instant)], cached: &mut Option<(Usage, Instant
     }
 }
 
+/// Makes `agent` send `prompt`; its tool definitions replace the tool
+/// set's only when they differ from `current`'s.
+fn use_prompt<T: Transport>(agent: &mut Agent<T>, prompt: &SessionPrompt, current: &SessionPrompt) {
+    agent.system = prompt.system.clone();
+    agent.tool_definitions = (prompt.tools != current.tools).then(|| prompt.tools.clone());
+}
+
 /// The system prompt: the working folder, and how to keep memory in
 /// `memory` when there is a memory folder.
 fn system_prompt(cwd: &Path, memory: Option<&Path>) -> String {
@@ -325,7 +333,12 @@ async fn compact<T: Transport>(
 /// The session file: created with the first message, and given up after
 /// the first failed write so the file never has gaps.
 enum Log {
-    Pending { dir: PathBuf, meta: SessionMeta },
+    /// Not created yet; `prompt` is recorded right after `meta`.
+    Pending {
+        dir: PathBuf,
+        meta: SessionMeta,
+        prompt: SessionPrompt,
+    },
     Open(SessionLog),
     Failed,
 }
@@ -339,6 +352,10 @@ impl Log {
         self.write(|file| file.drop_to(keep));
     }
 
+    fn record_prompt(&mut self, prompt: &SessionPrompt) {
+        self.write(|file| file.record_prompt(prompt));
+    }
+
     fn record_compact(&mut self, summary: &str) {
         self.write(|file| file.record_compact(summary));
     }
@@ -348,8 +365,11 @@ impl Log {
     }
 
     fn write(&mut self, op: impl FnOnce(&mut SessionLog) -> std::io::Result<()>) {
-        if let Log::Pending { dir, meta } = self {
-            *self = match SessionLog::create(dir, meta) {
+        if let Log::Pending { dir, meta, prompt } = self {
+            *self = match SessionLog::create(dir, meta).and_then(|mut file| {
+                file.record_prompt(prompt)?;
+                Ok(file)
+            }) {
                 Ok(file) => Log::Open(file),
                 Err(e) => {
                     println!("\n[session not saved: {}]", printable(&e.to_string()));
@@ -412,8 +432,14 @@ fn args() -> Result<Args, String> {
     Ok(parsed)
 }
 
-/// The session to write to and the history to start from.
-fn open_session(start: &Start, dir: &Path, cwd: &Path) -> Result<(Log, Vec<MessageParam>), String> {
+/// The session to write to, the history to start from, and the prompt its
+/// requests carry: the one recorded in a resumed session, else `current`.
+fn open_session(
+    start: &Start,
+    dir: &Path,
+    cwd: &Path,
+    current: &SessionPrompt,
+) -> Result<(Log, Vec<MessageParam>, SessionPrompt), String> {
     let cwd_text = cwd.display().to_string();
     let shown = |path: &Path| printable(&path.display().to_string());
     let path = match start {
@@ -434,8 +460,10 @@ fn open_session(start: &Start, dir: &Path, cwd: &Path) -> Result<(Log, Vec<Messa
                 Log::Pending {
                     dir: dir.to_path_buf(),
                     meta,
+                    prompt: current.clone(),
                 },
                 Vec::new(),
+                current.clone(),
             ));
         }
         Start::Continue => latest(dir, &cwd_text)
@@ -478,12 +506,29 @@ fn open_session(start: &Start, dir: &Path, cwd: &Path) -> Result<(Log, Vec<Messa
         println!("[the session ended during a tool call; it is answered as having no result]");
         file.append(repair).map_err(fail)?;
     }
+    let prompt = match loaded.prompt {
+        Some(recorded) => {
+            if &recorded != current {
+                println!(
+                    "[this session keeps the system prompt and tools it started with; this build's take effect after the next compaction]"
+                );
+            }
+            recorded
+        }
+        None => {
+            println!(
+                "[this session has no readable record of its system prompt; it resumes with this build's, and a request carrying earlier thinking may be refused]"
+            );
+            file.record_prompt(current).map_err(fail)?;
+            current.clone()
+        }
+    };
     println!(
         "session {} resumed with {} message(s)",
         printable(&loaded.meta.id),
         loaded.history.len()
     );
-    Ok((Log::Open(file), loaded.history))
+    Ok((Log::Open(file), loaded.history, prompt))
 }
 
 #[tokio::main]
@@ -515,13 +560,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = Agent::new(Client::new(config)?, MODEL, builtin(), context);
     agent.max_iterations = args.max_iterations;
     agent.prompt_cache = args.cache;
-    agent.system = vec![ContentBlock::text(system_prompt(&cwd, memory.as_deref()))];
+    // This build's prompt; a resumed session may carry an earlier one.
+    let current = SessionPrompt {
+        system: vec![ContentBlock::text(system_prompt(&cwd, memory.as_deref()))],
+        tools: agent.tools.definitions(),
+    };
 
     println!("just-harness · {MODEL} · {}", cwd.display());
     println!(
         "Type a request. Ctrl-C cancels a running request; Ctrl-C or Ctrl-D at the prompt quits."
     );
-    let (mut log, mut history) = open_session(&args.start, &sessions_dir(&home, &cwd), &cwd)?;
+    let (mut log, mut history, prompt) =
+        open_session(&args.start, &sessions_dir(&home, &cwd), &cwd, &current)?;
+    use_prompt(&mut agent, &prompt, &current);
     // Whether the next turn starts by carrying the instruction files and the
     // memory index: in a new session, and after a compaction.
     let mut needs_context = history.is_empty();
@@ -555,6 +606,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Compacted::Done => {
                     last_prompt = None;
                     needs_context = true;
+                    use_prompt(&mut agent, &current, &current);
+                    log.record_prompt(&current);
                 }
                 Compacted::Kept => {}
                 Compacted::Cancelled => continue,

@@ -6,7 +6,8 @@
 //! messages, or `{"type":"clear","before":<n>}`, which clears the tool results
 //! before message `n` as [`clear_before`] does, or
 //! `{"type":"compact","summary":<text>}`, which replaces the history with
-//! [`compacted`]`(summary)`.
+//! [`compacted`]`(summary)`, or `{"type":"prompt",...Prompt}`, the system
+//! prompt and tool definitions the requests carry from there on.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -23,7 +24,7 @@ use crate::clearing::clear_before;
 use crate::compaction::compacted;
 
 /// The format version written to new files; files with a higher one are refused.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The first line of a session file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +36,13 @@ pub struct SessionMeta {
     /// The working folder the session ran in.
     pub cwd: String,
     pub model: String,
+}
+
+/// The system prompt and tool definitions a session's requests carry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Prompt {
+    pub system: Vec<ContentBlock>,
+    pub tools: Vec<crate::api::Tool>,
 }
 
 /// An open session file that messages are appended to.
@@ -104,6 +112,13 @@ impl SessionLog {
         self.write_line(&json!({ "type": "compact", "summary": summary }))
     }
 
+    /// Records the prompt the session's requests carry from here on.
+    pub fn record_prompt(&mut self, prompt: &Prompt) -> std::io::Result<()> {
+        let mut line = serde_json::to_value(prompt)?;
+        line["type"] = json!("prompt");
+        self.write_line(&line)
+    }
+
     /// Writes one line and syncs it to the disk.
     fn write_line(&mut self, line: &Value) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(line)?;
@@ -127,6 +142,8 @@ pub struct Loaded {
     /// Results added for the tool calls of a history that ends on them, to
     /// append to the log when the session continues.
     pub repair: Option<MessageParam>,
+    /// The last prompt recorded; `None` for a file that records none.
+    pub prompt: Option<Prompt>,
 }
 
 /// Reads a session file. The first line must be the session's meta, of this
@@ -137,6 +154,7 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
     let meta = read_meta(path, lines.next().transpose()?)?;
 
     let mut history: Vec<MessageParam> = Vec::new();
+    let mut prompt = None;
     let mut skipped = 0;
     for line in lines {
         let line = line?;
@@ -155,6 +173,10 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
             Some("drop") => match record["keep"].as_u64() {
                 Some(keep) => history.truncate(keep as usize),
                 None => skipped += 1,
+            },
+            Some("prompt") => match serde_json::from_value(record.clone()) {
+                Ok(recorded) => prompt = Some(recorded),
+                Err(_) => skipped += 1,
             },
             Some("compact") => match record["summary"].as_str() {
                 Some(summary) => history = compacted(summary),
@@ -183,6 +205,7 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
         skipped,
         cut_at,
         repair,
+        prompt,
     })
 }
 

@@ -848,3 +848,36 @@ async fn a_single_request_has_the_turns_system_tools_and_cache_markers_and_runs_
     assert_eq!(usages, 1);
     assert_eq!(transport.requests().len(), 2);
 }
+
+#[tokio::test]
+async fn recorded_tool_definitions_are_sent_in_place_of_the_tool_sets() {
+    let echo: &'static Echo = Box::leak(Box::new(Echo::new("lookup", ToolOutput::ok("42"))));
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "lookup", json!({}))], "tool_use")],
+        )
+        .respond(200, vec![&text_reply("42.", "end_turn")]);
+    let (mut agent, _dir) = agent(&transport, ToolSet::new().with(echo));
+    let recorded = api::Tool {
+        name: "lookup".into(),
+        description: "an older description".into(),
+        input_schema: json!({ "type": "object", "properties": {} }),
+        cache_control: None,
+    };
+    agent.tool_definitions = Some(vec![recorded.clone()]);
+    let mut history = vec![user("look it up")];
+
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    for n in 0..2 {
+        assert_eq!(
+            sent_body(&transport, n)["tools"],
+            serde_json::to_value(vec![&recorded]).unwrap()
+        );
+    }
+    assert_eq!(echo.calls.lock().unwrap().len(), 1);
+}
