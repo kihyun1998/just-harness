@@ -67,16 +67,18 @@ pub trait Tool: Send + Sync {
 }
 
 /// The working folder. Paths given to file tools resolve against it and may
-/// not leave it.
+/// not leave it, except into a folder [`allow`](Self::allow)ed besides it.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     root: PathBuf,
+    allowed: Vec<PathBuf>,
 }
 
 impl ToolContext {
     pub fn new(root: impl AsRef<Path>) -> std::io::Result<Self> {
         Ok(Self {
             root: root.as_ref().canonicalize()?,
+            allowed: Vec::new(),
         })
     }
 
@@ -84,8 +86,19 @@ impl ToolContext {
         &self.root
     }
 
-    /// `path` as an absolute path inside the working folder, or the reason it
-    /// is refused. Symlinks are followed for the part of the path that exists.
+    /// Also allows `dir`, which must exist, and everything under it.
+    pub fn allow(mut self, dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        self.allowed.push(dir.as_ref().canonicalize()?);
+        Ok(self)
+    }
+
+    /// The folders allowed besides the working folder.
+    pub fn allowed(&self) -> &[PathBuf] {
+        &self.allowed
+    }
+
+    /// `path` as an absolute path inside the working folder or a folder
+    /// allowed beside it, or the reason it is refused. Symlinks are followed for the part of the path that exists.
     pub fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let mut folded = PathBuf::new();
         for component in self.root.join(path).components() {
@@ -114,10 +127,17 @@ impl ToolContext {
         for name in rest.iter().rev() {
             resolved.push(name);
         }
-        if !resolved.starts_with(&self.root) {
+        if !resolved.starts_with(&self.root)
+            && !self.allowed.iter().any(|dir| resolved.starts_with(dir))
+        {
             return Err(format!(
-                "{path}: outside the working folder {}",
-                self.root.display()
+                "{path}: outside the working folder {}{}",
+                self.root.display(),
+                if self.allowed.is_empty() {
+                    ""
+                } else {
+                    " and the folders allowed beside it"
+                }
             ));
         }
         Ok(resolved)

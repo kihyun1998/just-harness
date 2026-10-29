@@ -34,7 +34,7 @@ A reply cut at `max_tokens`, or ending with `refusal` or any stop reason other t
 ## Maintainer's calls (2026-10-28, each shown with its alternative)
 
 - **Iteration cap:** 50 requests per turn by default, `--max-iterations N` to change it. The SDK has no default cap. Reaching it ends the turn as `TurnEnd::IterationLimit`.
-- **Folder confinement:** `read_file`, `edit_file` and `search` refuse any path that leads outside the working folder, whether absolute, through `../` or through a symlink; an absolute path inside it is allowed. `shell` is not confined, so this guards against mistakes, not a hostile model. goose allows any absolute path.
+- **Folder confinement:** `read_file`, `edit_file` and `search` refuse any path that leads outside the working folder, whether absolute, through `../` or through a symlink; an absolute path inside it is allowed, and so is one inside a folder allowed beside it with `ToolContext::allow`, which the REPL uses for the memory folder ([memory](memory.md)). `shell` is not confined, so this guards against mistakes, not a hostile model. goose allows any absolute path.
 - **Secrets:** `read_file` and `edit_file` refuse `.env` and `.env.*` (not `.env.example`), also when reached through a symlink, so the API key in the working folder's `.env` does not land in the conversation or on screen. `search` already skips hidden files; `shell` can still read it. Chosen 2026-10-28, shown against leaving it readable.
 - **Entry point:** a terminal REPL in `src/main.rs`, not a library plus example.
 

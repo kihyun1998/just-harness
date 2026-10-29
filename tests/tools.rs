@@ -719,3 +719,40 @@ async fn approval_requests_show_the_command_or_the_edit_and_its_real_target() {
         )
     );
 }
+
+#[test]
+fn a_folder_allowed_besides_the_working_folder_is_reachable_by_its_absolute_path() {
+    let outer = tempfile::tempdir().unwrap();
+    write(outer.path(), "work/a.txt", "a");
+    write(outer.path(), "memory/MEMORY.md", "- note");
+    write(outer.path(), "memory/.env", "KEY=1");
+    write(outer.path(), "other/b.txt", "b");
+    let memory = outer.path().join("memory");
+    let context = ToolContext::new(outer.path().join("work"))
+        .unwrap()
+        .allow(&memory)
+        .unwrap();
+    let canonical = memory.canonicalize().unwrap();
+
+    let index = canonical.join("MEMORY.md");
+    assert_eq!(
+        context.resolve_file(index.to_str().unwrap()),
+        Ok(index.clone())
+    );
+    let new = canonical.join("role.md");
+    assert_eq!(context.resolve_file(new.to_str().unwrap()), Ok(new));
+    assert!(
+        context
+            .resolve_file(canonical.join(".env").to_str().unwrap())
+            .is_err()
+    );
+    let other = outer.path().join("other/b.txt");
+    assert!(
+        context
+            .resolve_file(other.to_str().unwrap())
+            .unwrap_err()
+            .contains("outside")
+    );
+    assert!(context.resolve_file("../memory/../other/b.txt").is_err());
+    assert_eq!(context.allowed(), [canonical]);
+}

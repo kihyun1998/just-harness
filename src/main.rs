@@ -1,6 +1,8 @@
 //! `just-harness`: a terminal REPL around the agent loop.
 
+use std::fs::DirBuilder;
 use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use just_harness::clearing::{ClearPolicy, clear_before, plan};
 use just_harness::compaction::{
     CompactPolicy, compacted, should_compact, summary, summary_request,
 };
+use just_harness::memory::{INDEX_MAX_BYTES, INDEX_MAX_LINES, Settings, load_context, memory_dir};
 use just_harness::session::{
     FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, now_secs, sessions_dir,
 };
@@ -221,6 +224,33 @@ fn report_usage(usages: &[(Usage, Instant)], cached: &mut Option<(Usage, Instant
             usages.len()
         );
     }
+}
+
+/// The system prompt: the working folder, and how to keep memory in
+/// `memory` when there is a memory folder.
+fn system_prompt(cwd: &Path, memory: Option<&Path>) -> String {
+    let mut prompt = format!(
+        "You are a coding agent working in the folder {}. Use the tools to search, read and \
+         edit files there and to run commands. Paths are relative to that folder.",
+        cwd.display()
+    );
+    if let Some(memory) = memory {
+        prompt += &format!(
+            "\n\nYou have a memory folder that lasts across sessions: {memory}. Keep in it what \
+             a later session would need and cannot find in the code, its history or the \
+             instruction files: the user's role and preferences, corrections and approaches the \
+             user confirmed (with why), ongoing work and decisions, and where outside \
+             information lives. Keep one fact per file, named for its subject, and one line \
+             pointing to each file in {memory}/MEMORY.md; the start of each session shows you \
+             its first {lines} lines, up to {bytes} bytes. Update a file rather than writing a \
+             second one, and delete what turns out wrong. Read and write these files with \
+             read_file and edit_file, by their absolute paths.",
+            memory = memory.display(),
+            lines = INDEX_MAX_LINES,
+            bytes = INDEX_MAX_BYTES,
+        );
+    }
+    prompt
 }
 
 /// How a compaction ended.
@@ -461,27 +491,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = args()?;
     let config =
         ClientConfig::from_lookup(setting).map_err(|e| format!("{e} (environment or ./.env)"))?;
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?);
+    let settings = Settings::load(&home.join(".just-harness").join("settings.json"))?;
     let context = ToolContext::new(".")?;
+    let cwd = context.root().to_path_buf();
+    let dir = memory_dir(&home, &cwd);
+    let (context, memory) = match DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .and_then(|()| context.clone().allow(&dir))
+    {
+        Ok(context) => (context, Some(dir)),
+        Err(e) => {
+            println!(
+                "[no memory folder at {}: {}; running without memory]",
+                printable(&dir.display().to_string()),
+                printable(&e.to_string())
+            );
+            (context, None)
+        }
+    };
     let mut agent = Agent::new(Client::new(config)?, MODEL, builtin(), context);
     agent.max_iterations = args.max_iterations;
     agent.prompt_cache = args.cache;
-    agent.system = vec![ContentBlock::text(format!(
-        "You are a coding agent working in the folder {}. Use the tools to search, read and edit \
-         files there and to run commands. Paths are relative to that folder.",
-        agent.context.root().display()
-    ))];
+    agent.system = vec![ContentBlock::text(system_prompt(&cwd, memory.as_deref()))];
 
-    println!(
-        "just-harness · {MODEL} · {}",
-        agent.context.root().display()
-    );
+    println!("just-harness · {MODEL} · {}", cwd.display());
     println!(
         "Type a request. Ctrl-C cancels a running request; Ctrl-C or Ctrl-D at the prompt quits."
     );
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set")?;
-    let cwd = agent.context.root().to_path_buf();
-    let (mut log, mut history) =
-        open_session(&args.start, &sessions_dir(Path::new(&home), &cwd), &cwd)?;
+    let (mut log, mut history) = open_session(&args.start, &sessions_dir(&home, &cwd), &cwd)?;
+    // Whether the next turn starts by carrying the instruction files and the
+    // memory index: in a new session, and after a compaction.
+    let mut needs_context = history.is_empty();
     let mut allowed = HashSet::new();
     let mut cached: Option<(Usage, Instant)> = None;
     let clearing = ClearPolicy::default();
@@ -509,7 +552,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             report_usage(&compaction.usages, &mut cached, args.cache);
             cached = None;
             match compaction.end {
-                Compacted::Done => last_prompt = None,
+                Compacted::Done => {
+                    last_prompt = None;
+                    needs_context = true;
+                }
                 Compacted::Kept => {}
                 Compacted::Cancelled => continue,
             }
@@ -522,6 +568,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cleared.results, cleared.bytes, cleared.thinking
             );
             cached = None;
+        }
+        if needs_context {
+            needs_context = false;
+            let loaded = load_context(&home, &cwd, memory.as_deref(), settings.instruction_files);
+            for path in &loaded.read {
+                println!("[loaded {}]", printable(&path.display().to_string()));
+            }
+            for (path, why) in &loaded.skipped {
+                println!(
+                    "[not loaded {}: {}]",
+                    printable(&path.display().to_string()),
+                    printable(why)
+                );
+            }
+            if let Some(message) = loaded.message {
+                log.append(&message);
+                history.push(message);
+            }
         }
         let before = history.len();
         let message = MessageParam {

@@ -10,3 +10,4 @@ The territory map. A comment's why, trap and measured value go to a note here. N
 - [Prompt cache](prompt-cache.md): the request shape that makes the cache hit, and the per-turn report.
 - [Clearing old tool results](tool-result-clearing.md): `src/clearing.rs`, the REPL's turn start, and the thinking it has to remove.
 - [Compaction](compaction.md): `src/compaction.rs`, the summary request and the history that continues from it.
+- [Project memory](memory.md): `src/memory.rs`, the instruction files and the model's memory folder, carried in one message.

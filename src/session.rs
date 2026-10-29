@@ -261,8 +261,14 @@ fn invalid(path: &Path, why: &str) -> std::io::Error {
 /// The folder holding the sessions of working folder `cwd`, under `home`:
 /// `<home>/.just-harness/sessions/<cwd with each / as ->`.
 pub fn sessions_dir(home: &Path, cwd: &Path) -> PathBuf {
-    let slug = cwd.to_string_lossy().replace('/', "-");
-    home.join(".just-harness").join("sessions").join(slug)
+    home.join(".just-harness")
+        .join("sessions")
+        .join(folder_slug(cwd))
+}
+
+/// `cwd` as one folder name: each `/` as `-`.
+pub fn folder_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy().replace('/', "-")
 }
 
 /// The most recently modified session file in `dir` whose meta names `cwd`.

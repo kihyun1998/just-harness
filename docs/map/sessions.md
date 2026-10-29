@@ -22,7 +22,7 @@ Maintainer's calls (2026-10-29, each shown with its alternatives): the folder-pe
 
 ## What is not in the file
 
-The system prompt is rebuilt when the REPL starts, and the `a` allow-for-the-session answers (see [agent-loop](agent-loop.md), Approval) start empty on resume, so a resumed session asks again. A session resumed from another working folder runs its tools in the new one; the REPL warns when `cwd` differs. Paths, ids and errors read from a session file are printed through `printable`.
+The system prompt is rebuilt when the REPL starts, and the `a` allow-for-the-session answers (see [agent-loop](agent-loop.md), Approval) start empty on resume, so a resumed session asks again. A session resumed from another working folder runs its tools in the new one; the REPL warns when `cwd` differs. Its recorded project context still names the first folder's memory folder, while the system prompt and the file tools now name the new folder's ([memory](memory.md)). Paths, ids and errors read from a session file are printed through `printable`.
 
 ## How messages reach the file
 
