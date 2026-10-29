@@ -17,6 +17,8 @@ pub trait Observer {
     fn on_event(&mut self, _event: &Value) {}
     fn on_tool_call(&mut self, _name: &str, _input: &Value) {}
     fn on_tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
+    /// A message `run_turn` appended to the history, after it was appended.
+    fn on_message(&mut self, _message: &MessageParam) {}
 }
 
 impl Observer for () {}
@@ -127,11 +129,11 @@ impl<T: Transport> Agent<T> {
             request.extra = self.extra.clone();
             let message = self.client.send(&request, |e| observer.on_event(e)).await?;
             iterations += 1;
-            history.push(message.to_param());
+            append(history, observer, message.to_param());
 
             if user_stopped {
                 if let Some(not_run) = not_run_results(&message, USER_STOPPED) {
-                    history.push(not_run);
+                    append(history, observer, not_run);
                 }
                 return Ok(outcome(TurnEnd::StoppedByUser, iterations, message));
             }
@@ -140,14 +142,14 @@ impl<T: Transport> Agent<T> {
                 Step::Stop => {
                     let why = format!("the reply stopped at {}", stop_reason_name(&message));
                     if let Some(not_run) = not_run_results(&message, &why) {
-                        history.push(not_run);
+                        append(history, observer, not_run);
                     }
                     return Ok(outcome(stopped, iterations, message));
                 }
                 Step::Resume => {}
                 Step::RunTools => match self.run_tools(&message, observer, approver).await {
                     Some((results, stop)) => {
-                        history.push(results);
+                        append(history, observer, results);
                         user_stopped = stop;
                     }
                     None => return Ok(outcome(stopped, iterations, message)),
@@ -248,6 +250,14 @@ fn not_run_results(message: &Message, why: &str) -> Option<MessageParam> {
         role: Role::User,
         content: results,
     })
+}
+
+/// Appends `message` to `history` and reports it.
+fn append(history: &mut Vec<MessageParam>, observer: &mut impl Observer, message: MessageParam) {
+    history.push(message);
+    if let Some(last) = history.last() {
+        observer.on_message(last);
+    }
 }
 
 fn outcome(end: TurnEnd, iterations: u32, last_message: Message) -> TurnOutcome {

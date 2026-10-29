@@ -513,3 +513,67 @@ async fn sends_the_agents_extra_request_fields_with_every_request() {
         );
     }
 }
+
+/// Keeps every message the loop reports appending.
+#[derive(Default)]
+struct Appended(Vec<just_harness::api::MessageParam>);
+
+impl just_harness::agent::Observer for Appended {
+    fn on_message(&mut self, message: &just_harness::api::MessageParam) {
+        self.0.push(message.clone());
+    }
+}
+
+#[tokio::test]
+async fn reports_every_message_it_appends_in_order() {
+    let echo = leak(Echo::new("look", ToolOutput::ok("seen")));
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "look", json!({}))], "tool_use")],
+        )
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_2", "look", json!({}))], "max_tokens")],
+        );
+    let (agent, _dir) = agent(&transport, ToolSet::new().with(echo));
+    let mut history = vec![user("go")];
+    let mut appended = Appended::default();
+
+    agent
+        .run_turn(&mut history, &mut appended, &mut AllowAll)
+        .await
+        .unwrap();
+
+    assert_eq!(history.len(), 5);
+    assert_eq!(appended.0, history[1..].to_vec());
+}
+
+#[tokio::test]
+async fn reports_the_not_run_results_of_a_stopped_turn() {
+    let write = guarded("change");
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "change", json!({}))], "tool_use")],
+        )
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_2", "change", json!({}))], "tool_use")],
+        );
+    let (agent, _dir) = agent(&transport, ToolSet::new().with(write));
+    let mut history = vec![user("go")];
+    let mut appended = Appended::default();
+
+    agent
+        .run_turn(
+            &mut history,
+            &mut appended,
+            &mut Scripted::new(vec![Approval::Stop]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(history.len(), 5);
+    assert_eq!(appended.0, history[1..].to_vec());
+}

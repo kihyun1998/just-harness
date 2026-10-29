@@ -3,21 +3,32 @@
 use std::io::Write;
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use just_harness::agent::{
     Agent, Approval, ApprovalRequest, Approver, DEFAULT_MAX_ITERATIONS, Observer, TurnEnd,
 };
 use just_harness::api::{Client, ClientConfig, ContentBlock, MessageParam, Role};
+use just_harness::session::{
+    FORMAT_VERSION, SessionLog, SessionMeta, latest, load, new_id, now_secs, sessions_dir,
+};
 use just_harness::tools::{ToolContext, ToolOutput, builtin};
 use serde_json::Value;
 
 const MODEL: &str = "claude-haiku-5-5";
-const USAGE: &str = "usage: just-harness [--max-iterations N]";
+const USAGE: &str = "usage: just-harness [--max-iterations N] [--continue | --resume <id|path>]";
 
-/// Prints the reply as it streams and one line per tool call and result.
-struct Terminal;
+/// Prints the reply as it streams and one line per tool call and result, and
+/// appends each message the loop adds to the session log.
+struct Terminal<'a> {
+    log: &'a mut Log,
+}
 
-impl Observer for Terminal {
+impl Observer for Terminal<'_> {
+    fn on_message(&mut self, message: &MessageParam) {
+        self.log.append(message);
+    }
+
     fn on_event(&mut self, event: &Value) {
         if event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta" {
             print!(
@@ -157,27 +168,167 @@ fn setting(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn max_iterations() -> Result<u32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [] => Ok(DEFAULT_MAX_ITERATIONS),
-        [flag, n] if flag == "--max-iterations" => n
-            .parse()
-            .ok()
-            .filter(|&n: &u32| n > 0)
-            .ok_or_else(|| format!("--max-iterations needs a positive number\n{USAGE}")),
-        _ => Err(USAGE.into()),
+/// The session file: created with the first message, and given up after
+/// the first failed write so the file never has gaps.
+enum Log {
+    Pending { dir: PathBuf, meta: SessionMeta },
+    Open(SessionLog),
+    Failed,
+}
+
+impl Log {
+    fn append(&mut self, message: &MessageParam) {
+        self.write(|file| file.append(message));
     }
+
+    fn drop_to(&mut self, keep: usize) {
+        self.write(|file| file.drop_to(keep));
+    }
+
+    fn write(&mut self, op: impl FnOnce(&mut SessionLog) -> std::io::Result<()>) {
+        if let Log::Pending { dir, meta } = self {
+            *self = match SessionLog::create(dir, meta) {
+                Ok(file) => Log::Open(file),
+                Err(e) => {
+                    println!("\n[session not saved: {}]", printable(&e.to_string()));
+                    Log::Failed
+                }
+            };
+        }
+        if let Log::Open(file) = self
+            && let Err(e) = op(file)
+        {
+            println!(
+                "\n[session file {}: {}; nothing more is written to it]",
+                printable(&file.path().display().to_string()),
+                printable(&e.to_string())
+            );
+            *self = Log::Failed;
+        }
+    }
+}
+
+enum Start {
+    New,
+    Continue,
+    Resume(String),
+}
+
+struct Args {
+    max_iterations: u32,
+    start: Start,
+}
+
+fn args() -> Result<Args, String> {
+    let mut parsed = Args {
+        max_iterations: DEFAULT_MAX_ITERATIONS,
+        start: Start::New,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--max-iterations" => {
+                parsed.max_iterations = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .filter(|&n: &u32| n > 0)
+                    .ok_or_else(|| format!("--max-iterations needs a positive number\n{USAGE}"))?;
+            }
+            "--continue" if matches!(parsed.start, Start::New) => parsed.start = Start::Continue,
+            "--resume" if matches!(parsed.start, Start::New) => {
+                let target = args
+                    .next()
+                    .ok_or_else(|| format!("--resume needs an id or a path\n{USAGE}"))?;
+                parsed.start = Start::Resume(target);
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    Ok(parsed)
+}
+
+/// The session to write to and the history to start from.
+fn open_session(start: &Start, dir: &Path, cwd: &Path) -> Result<(Log, Vec<MessageParam>), String> {
+    let cwd_text = cwd.display().to_string();
+    let shown = |path: &Path| printable(&path.display().to_string());
+    let path = match start {
+        Start::New => {
+            let meta = SessionMeta {
+                version: FORMAT_VERSION,
+                id: new_id(),
+                created: now_secs(),
+                cwd: cwd_text,
+                model: MODEL.into(),
+            };
+            println!(
+                "session {} (saved to {} from the first message)",
+                meta.id,
+                shown(dir)
+            );
+            return Ok((
+                Log::Pending {
+                    dir: dir.to_path_buf(),
+                    meta,
+                },
+                Vec::new(),
+            ));
+        }
+        Start::Continue => latest(dir, &cwd_text)
+            .map_err(|e| format!("{}: {}", shown(dir), printable(&e.to_string())))?
+            .ok_or_else(|| {
+                format!(
+                    "no session to continue for this folder (looked in {})",
+                    shown(dir)
+                )
+            })?,
+        Start::Resume(target) if target.contains('/') || target.ends_with(".jsonl") => {
+            PathBuf::from(target)
+        }
+        Start::Resume(id) => dir.join(format!("{id}.jsonl")),
+    };
+    let fail = |e: std::io::Error| printable(&e.to_string());
+    let loaded = load(&path).map_err(fail)?;
+    if loaded.skipped > 0 {
+        println!(
+            "[{} unreadable line(s) in the session file were skipped]",
+            loaded.skipped
+        );
+    }
+    if loaded.meta.cwd != cwd_text {
+        println!(
+            "[this session ran in {}; tools now work in {}]",
+            printable(&loaded.meta.cwd),
+            printable(&cwd_text)
+        );
+    }
+    let mut file = SessionLog::open(&path).map_err(fail)?;
+    if let Some(at) = loaded.cut_at {
+        println!(
+            "[a tool call at message {} has no recorded result; the history is cut there]",
+            at + 1
+        );
+        file.drop_to(at).map_err(fail)?;
+    }
+    if let Some(repair) = &loaded.repair {
+        println!("[the session ended during a tool call; it is answered as having no result]");
+        file.append(repair).map_err(fail)?;
+    }
+    println!(
+        "session {} resumed with {} message(s)",
+        printable(&loaded.meta.id),
+        loaded.history.len()
+    );
+    Ok((Log::Open(file), loaded.history))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let max_iterations = max_iterations()?;
+    let args = args()?;
     let config =
         ClientConfig::from_lookup(setting).map_err(|e| format!("{e} (environment or ./.env)"))?;
     let context = ToolContext::new(".")?;
     let mut agent = Agent::new(Client::new(config)?, MODEL, builtin(), context);
-    agent.max_iterations = max_iterations;
+    agent.max_iterations = args.max_iterations;
     agent.system = vec![ContentBlock::text(format!(
         "You are a coding agent working in the folder {}. Use the tools to search, read and edit \
          files there and to run commands. Paths are relative to that folder.",
@@ -191,8 +342,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Type a request. Ctrl-C cancels a running request; Ctrl-C or Ctrl-D at the prompt quits."
     );
-    let mut history: Vec<MessageParam> = Vec::new();
-    let mut session = HashSet::new();
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set")?;
+    let cwd = agent.context.root().to_path_buf();
+    let (mut log, mut history) =
+        open_session(&args.start, &sessions_dir(Path::new(&home), &cwd), &cwd)?;
+    let mut allowed = HashSet::new();
     let mut lines = input_lines();
     loop {
         print!("\n> ");
@@ -208,14 +362,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let before = history.len();
-        history.push(MessageParam {
+        let message = MessageParam {
             role: Role::User,
             content: vec![ContentBlock::text(line)],
-        });
-        let mut terminal = Terminal;
+        };
+        log.append(&message);
+        history.push(message);
+        let mut terminal = Terminal { log: &mut log };
         let mut approver = Prompt {
             lines: &mut lines,
-            session: &mut session,
+            session: &mut allowed,
         };
         let result = tokio::select! {
             result = agent.run_turn(&mut history, &mut terminal, &mut approver) => Some(result),
@@ -223,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let Some(result) = result else {
             history.truncate(before);
+            log.drop_to(before);
             println!("\n[cancelled; this request was dropped from the conversation]");
             continue;
         };
@@ -247,6 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(error) => {
                 history.truncate(before);
+                log.drop_to(before);
                 println!("\n[error: {error}; this request was dropped from the conversation]");
             }
         }
