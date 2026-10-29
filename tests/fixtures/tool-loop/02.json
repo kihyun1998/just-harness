@@ -1,0 +1,22 @@
+{
+  "chunks": [
+    935,
+    420,
+    727,
+    1159,
+    663,
+    378,
+    0
+  ],
+  "headers": [
+    [
+      "content-type",
+      "text/event-stream; charset=utf-8"
+    ],
+    [
+      "request-id",
+      "req_011CgVYuVm8YZr8gx1VzNZLT"
+    ]
+  ],
+  "status": 200
+}

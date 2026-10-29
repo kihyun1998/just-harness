@@ -1,0 +1,90 @@
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-haiku-5-5","id":"msg_011CgVYueo6ngDhUabno9rfs","type":"message","role":"assistant","content":[],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":1656,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":"standard","inference_geo":"global","speed":"standard"},"diagnostics":null}  }
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}           }
+
+event: ping
+data: {"type": "ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}     }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"CAQSpQYKEAgTGAI4AUIIdGhpbmtpbmcSDKqOiIwTCDqdHm+TdhoMO8+dOA1i3RtUQEEkIjBFQ6+f5tc+noUAgLdsHFCQggVJI32l06lxing//4muMKdaukNgyLqVclVQkpwd1K0qwgVPx8Ear7TqePgJo2GMKOI7+CgzxL0PbCzNX8TlxnOC+/w+U2Pg+RXbyLVQa6IwMcrmtlu/tbk4wQZLBiu/LKjyS3vTaKQnSDcwFiBYXLCITUlvyWG5blJaBdrW7m0bICiziAecDl3kKPC+uxr9SYPit6y2sky/He3YptGCohIC/mvGsssMFLJtgNxbxCJkwZ4MdFcd9WnScmCPZE+rsxZPZcN1+a2KHbMuUM41i+Bh6PVRt5zd02bjCo4Z+EGv+2OYCGikNkdsuFG78ZyyInhAWY9F4nwPzO8ig2bxgIusoxyf6X9qrk5GblBAa1MM+mkOMq5SzXgdy47Ga4eLmEzMU+15usW0WjbJak1N3BM4xng7FLR67fnxu53GGIhCCqRs8qWz+9snrrcB3ZX/B0jIhIH0DP3X/X/cD2es/GdUq079kgcXNBIviOueCIT3Aoss3YHQNAv8jVXpBxZO4qDjCzrPtIQaCMUgGWtD6yV7qHrsgVaLoUbcTnqsJKZWdWEcPfSMhQ9n3/IQjHksXJ0L0ucw7mryi914FB+Cd3K3GJFJZrFWGoWHVLK/0Ia2S8YRn0FrcGN3WhHLTbg+QHi/1flt1xgsjY+og40VVaHpt4Sx/KsAMSQfE8CIflOKOXu9j/vYxL9vDsK0luG94dmH+CtWuMRjr1EbsIKtlcnTW3XSsoYgAnneQ+yUoQN0zQbqRpu2fp5WLgRbyTE42nuuJ1yTdlkvIBu4BJ9ysuRKRt9qTswu8O8im+71EmvcGJctATEjkGMmT8+cxiMlZvV1ziQCuohPY0tkMMwnrECzR5UHXWIAqJDuroV+MHWGC2oi96uYsLu20dXHUIySQUnmP+lPiCekKm32+FxI2Fs3t5QXY6PWqWr3uQGEwwoWF4yjUUgtN68mZXjEDmTp60kJIx1JsCvPNCwOeMOrTroEpDxBGAE="}     }
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0         }
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}             }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I changed \""}           }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"world\" to \"harness\" in"}        }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" h"}               }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ello.txt."}             }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" Running `cat hello.tx"}          }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"t` sh"}           }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ows the"}    }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" file now reads `hello har"}               }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ness`.\n\nI ran the"}    }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" edit and the `cat`"}      }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" in the same bat"} }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ch, so the conf"}            }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"irmation is"}     }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"n't str"}       }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ictly ordered after"}     }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" the edit. The output shows"}     }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" the new"}          }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" text"}              }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":","}       }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" though."}  }
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1       }
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"container":null},"usage":{"input_tokens":1656,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":151,"output_tokens_details":{"thinking_tokens":57}}      }
+
+event: message_stop
+data: {"type":"message_stop"       }
+

@@ -486,3 +486,30 @@ async fn stop_on_the_last_allowed_request_still_gets_its_one_more_reply() {
     assert_eq!(outcome.end, TurnEnd::StoppedByUser);
     assert_eq!(transport.requests().len(), 2);
 }
+
+#[tokio::test]
+async fn sends_the_agents_extra_request_fields_with_every_request() {
+    let echo = leak(Echo::new("look", ToolOutput::ok("seen")));
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "look", json!({}))], "tool_use")],
+        )
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let (mut agent, _dir) = agent(&transport, ToolSet::new().with(echo));
+    agent
+        .extra
+        .insert("output_config".into(), json!({ "effort": "high" }));
+
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    for n in 0..2 {
+        assert_eq!(
+            sent_body(&transport, n)["output_config"],
+            json!({ "effort": "high" })
+        );
+    }
+}

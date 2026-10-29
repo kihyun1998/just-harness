@@ -170,3 +170,54 @@ pub fn user(text: &str) -> MessageParam {
         content: vec![ContentBlock::text(text)],
     }
 }
+
+/// A transport that plays back the responses `examples/record.rs` recorded
+/// under `tests/fixtures/<scenario>/` (`NN.json` and `NN.body`), in order,
+/// each body cut into the chunks it arrived in.
+pub fn replay(scenario: &str) -> FakeTransport {
+    let dir = std::path::Path::new("tests/fixtures").join(scenario);
+    let mut metas: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter(|p| !p.to_string_lossy().ends_with(".request.json"))
+        .collect();
+    metas.sort();
+    let transport = FakeTransport::new();
+    for meta_path in metas {
+        let meta: Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let body = Bytes::from(std::fs::read(meta_path.with_extension("body")).unwrap());
+        let mut chunks = Vec::new();
+        let mut at = 0;
+        for size in meta["chunks"].as_array().unwrap() {
+            let size = size.as_u64().unwrap() as usize;
+            chunks.push(body.slice(at..at + size));
+            at += size;
+        }
+        assert_eq!(
+            at,
+            body.len(),
+            "{}: chunk sizes do not cover the body",
+            meta_path.display()
+        );
+        let headers = meta["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h[0].as_str().unwrap().to_string(),
+                    h[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let status = meta["status"].as_u64().unwrap() as u16;
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok((status, headers, chunks)));
+    }
+    transport
+}

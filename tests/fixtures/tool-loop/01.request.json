@@ -1,0 +1,121 @@
+{
+  "max_tokens": 64000,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Read hello.txt, change \"world\" to \"harness\" in it, then run cat hello.txt to confirm.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "claude-haiku-5-5",
+  "output_config": {
+    "effort": "high"
+  },
+  "stream": true,
+  "system": [
+    {
+      "text": "You are a coding agent working in a folder. Use the tools to search, read and edit files there and to run commands. Paths are relative to that folder.",
+      "type": "text"
+    }
+  ],
+  "tools": [
+    {
+      "description": "Read a text file in the working folder. Lines come back numbered from 1, as `<number>\\t<line>`. Reads up to 2000 lines unless `limit` says otherwise, and at most 50000 bytes; use `offset` to continue. Lines over 2000 characters are cut.",
+      "input_schema": {
+        "properties": {
+          "limit": {
+            "description": "Most lines to read",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "description": "First line to read, from 1",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Path relative to the working folder",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "read_file"
+    },
+    {
+      "description": "Replace `old_string` with `new_string` in a file in the working folder. `old_string` must match the file exactly, whitespace included, and must occur exactly once; include surrounding lines to make it unique. To create a file, or fill an empty one, give an empty `old_string`.",
+      "input_schema": {
+        "properties": {
+          "new_string": {
+            "description": "Text to put in its place",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "Exact text to replace",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path relative to the working folder",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "old_string",
+          "new_string"
+        ],
+        "type": "object"
+      },
+      "name": "edit_file"
+    },
+    {
+      "description": "Run a command with `sh -c` in the working folder and return its exit code, stdout and stderr. A non-zero exit code is reported, not treated as a failure. Each stream keeps its last 2000 lines or 50000 bytes. The command is done when its process exits; a background job (`&`) keeps running and its later output is not returned. The command is killed after `timeout_secs` (default 120, at most 600). There is no terminal and no stdin.",
+      "input_schema": {
+        "properties": {
+          "command": {
+            "description": "The shell command line",
+            "type": "string"
+          },
+          "timeout_secs": {
+            "maximum": 600,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "shell"
+    },
+    {
+      "description": "Search the working folder. With `pattern` (a regex), returns matching lines as `path:line:text`. With only `glob`, lists matching files. With both, searches only files matching `glob`. A glob without `/` matches file names anywhere; with `/` it matches the path from the working folder, e.g. `src/**/*.rs`. Hidden files and paths in `.gitignore` are skipped. At most 500 results.",
+      "input_schema": {
+        "properties": {
+          "glob": {
+            "description": "Glob that file paths must match",
+            "type": "string"
+          },
+          "path": {
+            "description": "Folder to search, relative to the working folder; defaults to all of it",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "Regex to find in file contents",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "search"
+    }
+  ]
+}

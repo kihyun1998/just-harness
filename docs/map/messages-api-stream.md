@@ -10,7 +10,7 @@ How `src/api/` sends a request and turns the streamed reply into one `Message`, 
 
 - Usage on `message_delta` is a running total. It replaces the value from `message_start`; adding the two double-counts.
 - Tool input arrives as JSON text split across `input_json_delta` events. It is buffered per block index and parsed once, in `finish`, after `message_delta` has set the stop reason.
-- Tool input that does not parse fails the message, except when the stop reason is `max_tokens`: then the block keeps the input it started with (usually `{}`) and the message, with the text and usage already paid for, is still returned. The agent loop does not run tool calls from such a reply and answers them as not run ([agent-loop](agent-loop.md)). Whether the API sends `content_block_stop` for a block cut by `max_tokens` has not been observed.
+- Tool input that does not parse fails the message, except when the stop reason is `max_tokens`: then the block keeps the input it started with (usually `{}`) and the message, with the text and usage already paid for, is still returned. The agent loop does not run tool calls from such a reply and answers them as not run ([agent-loop](agent-loop.md)). The API sends no `content_block_stop` for a block cut by `max_tokens`: the recording `tests/fixtures/max-tokens/01` goes from the last `input_json_delta` straight to `message_delta` and `message_stop`, so the buffer is parsed only in `finish`, never at a block stop.
 - A stream that ends without `message_stop` is a `Transport` error: the connection broke off. An event before `message_start` is a `Protocol` error.
 - SSE events with no `event:` name are skipped, as the SDK does. `ping` is skipped. An `error` event becomes `ApiError::Stream`.
 
@@ -34,6 +34,18 @@ The key goes in `Authorization: Bearer`, as the SDK sends it. Live calls on 2026
 ## Seen live
 
 From the `examples/smoke.rs` runs on 2026-10-28: a short text reply was 6 events, a tool call 10. At `output_config.effort: "high"` the reply to a tool result carried a thinking block with empty `thinking` text and a 932-character `signature`. No tool-call reply has carried a thinking block yet, so sending one back to the API has not been observed; the fake-transport test covers it.
+
+## Recorded fixtures
+
+`examples/record.rs` records real exchanges into `tests/fixtures/<scenario>/`: `NN.request.json` holds each request's JSON body, `NN.body` the response body bytes as received, and `NN.json` the status, the `content-type` and `request-id` headers, and each chunk's size, so `tests/support` `replay` hands the decoder the same chunk boundaries. Request headers are not stored, so the key is not; other response headers are dropped because they may identify the account. `tests/replay.rs` sets each test up from the recorded first request and checks that every request it sends equals the recorded one, so a change to a tool's description, a tool's output or the request shape fails the replay until it is recorded again; its expected response values come from the recorded bodies through a plain parse that does not use the decoder.
+
+The recorder asks y/n at the terminal before `shell` and `edit_file`, and writes nothing unless every scenario finished with 200 responses, so a retried 429 or a failed scenario leaves the previous set whole. Re-recording spends API credit and changes the model's replies. Maintainer's calls (2026-10-28): which scenarios to record (shown with a 400-error scenario, not chosen); storing request bodies, decided after first choosing not to on the reason that the key is in a header, which covers headers only; asking before tool calls rather than allowing all or only expected calls.
+
+Recorded 2026-10-29 against `claude-haiku-5-5`: `text` (one reply), `tool-loop` (three replies: `read_file`; `edit_file` and `shell` together in one reply, run in order; then a `thinking` block and text, at `effort: high`), `max-tokens` (one reply cut inside an `edit_file` call at `max_tokens: 200`). What the recordings showed:
+
+- Every chunk boundary fell between events: 34 boundaries in five bodies (17 in six bodies of an earlier recording on 2026-10-28), none inside an event, and every body ended with an empty chunk. The replay tests therefore never split an event; that path is covered by the SSE decoder's own `a_split_at_any_byte_gives_the_same_events`.
+- `ping` arrives mid-stream, after the first `content_block_start`.
+- `message_delta` carries `stop_details: null` and `container: null` when they do not apply.
 
 ## Measured
 

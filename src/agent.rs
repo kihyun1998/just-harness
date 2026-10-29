@@ -81,6 +81,8 @@ pub struct Agent<T: Transport> {
     pub model: String,
     pub max_tokens: u32,
     pub system: Vec<ContentBlock>,
+    /// Further top-level request fields, sent with every request.
+    pub extra: serde_json::Map<String, Value>,
     pub tools: ToolSet,
     pub context: ToolContext,
     /// Requests one turn may send.
@@ -99,6 +101,7 @@ impl<T: Transport> Agent<T> {
             model: model.into(),
             max_tokens: 64_000,
             system: Vec::new(),
+            extra: serde_json::Map::new(),
             tools,
             context,
             max_iterations: DEFAULT_MAX_ITERATIONS,
@@ -121,6 +124,7 @@ impl<T: Transport> Agent<T> {
                 CreateMessageRequest::new(&self.model, self.max_tokens, history.clone());
             request.system = self.system.clone();
             request.tools = self.tools.definitions();
+            request.extra = self.extra.clone();
             let message = self.client.send(&request, |e| observer.on_event(e)).await?;
             iterations += 1;
             history.push(message.to_param());
