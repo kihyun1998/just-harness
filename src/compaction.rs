@@ -1,7 +1,11 @@
-//! Compacting a conversation into a summary the model writes, and
-//! continuing from that summary alone.
+//! Compacting a conversation into a summary the model writes, when to stop
+//! trying, and the recent files brought back after it.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::api::{BlockKind, ContentBlock, Message, MessageParam, Role, StopReason};
+use crate::tools::ToolContext;
 
 /// The user message appended to the history to ask for the summary.
 pub const SUMMARY_REQUEST: &str = "The conversation is about to be compacted: everything above \
@@ -23,12 +27,92 @@ written by the assistant before the compaction. Continue the work from it.";
 pub struct CompactPolicy {
     /// Compact once the last request's prompt reached this many tokens.
     pub trigger_tokens: u64,
+    /// Attempts in a row that may make no room before automatic compaction
+    /// stops.
+    pub max_attempts: u32,
 }
 
 impl Default for CompactPolicy {
     fn default() -> Self {
         Self {
             trigger_tokens: 90_000,
+            max_attempts: 3,
+        }
+    }
+}
+
+/// What [`CompactGuard::gate`] says to do at the start of a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactGate {
+    /// The conversation is below the trigger, or there is no usage to go by.
+    Wait,
+    /// Compact a conversation of `tokens`, then report it to the guard with
+    /// [`CompactGuard::compacted`] or [`CompactGuard::attempted`], unless it
+    /// was cancelled.
+    Attempt { tokens: u64 },
+    /// The attempts ran out on this turn; say so.
+    JustStopped,
+    /// The attempts ran out on an earlier turn.
+    Stopped,
+}
+
+/// Counts compaction attempts in a row that made no room. An attempt makes
+/// room when the first request after its summary is below the trigger; a
+/// turn ending below the trigger also starts the count over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactGuard {
+    attempts: u32,
+    reported: bool,
+    /// A summary was made and no request has been sent since.
+    awaiting_first_request: bool,
+}
+
+impl CompactGuard {
+    /// What to do for `history`, given the prompt and reply of the last
+    /// request of the last turn kept, when there is one.
+    pub fn gate(
+        &mut self,
+        history: &[MessageParam],
+        policy: &CompactPolicy,
+        last_tokens: Option<u64>,
+    ) -> CompactGate {
+        let Some(tokens) = last_tokens else {
+            return CompactGate::Wait;
+        };
+        if tokens < policy.trigger_tokens {
+            *self = Self::default();
+            return CompactGate::Wait;
+        }
+        if !should_compact(history, policy, tokens) {
+            return CompactGate::Wait;
+        }
+        if self.attempts < policy.max_attempts {
+            return CompactGate::Attempt { tokens };
+        }
+        if std::mem::replace(&mut self.reported, true) {
+            CompactGate::Stopped
+        } else {
+            CompactGate::JustStopped
+        }
+    }
+
+    /// Counts an attempt that ended with no summary.
+    pub fn attempted(&mut self) {
+        self.attempts += 1;
+    }
+
+    /// Counts an attempt that ended in a summary, until
+    /// [`first_request`](Self::first_request) says whether it made room.
+    pub fn compacted(&mut self) {
+        self.attempts += 1;
+        self.awaiting_first_request = true;
+    }
+
+    /// Takes the prompt size of a turn's first request.
+    pub fn first_request(&mut self, prompt_tokens: u64, policy: &CompactPolicy) {
+        if std::mem::take(&mut self.awaiting_first_request) && prompt_tokens < policy.trigger_tokens
+        {
+            *self = Self::default();
         }
     }
 }
@@ -83,4 +167,119 @@ pub fn compacted(summary: &str) -> Vec<MessageParam> {
         role: Role::User,
         content: vec![ContentBlock::text(format!("{SUMMARY_PREFIX}\n\n{summary}"))],
     }]
+}
+
+/// The most files [`put_back`] brings back after a compaction.
+pub const PUT_BACK_FILES: usize = 5;
+/// The most tokens of a file [`put_back`] brings back; over it, only its path.
+pub const PUT_BACK_MAX_TOKENS: u64 = 5_000;
+/// The bytes counted as one token when sizing a file for [`put_back`].
+pub const BYTES_PER_TOKEN: u64 = 4;
+
+/// The files `read_file` and `edit_file` succeeded on in a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TouchedFiles {
+    calls: HashMap<String, PathBuf>,
+    paths: Vec<PathBuf>,
+}
+
+impl TouchedFiles {
+    /// Takes in the next message of the session, sent while working in `cwd`.
+    pub fn observe(&mut self, message: &MessageParam, cwd: &Path) {
+        for block in &message.content {
+            if let BlockKind::ToolUse { id, name, input } = block.kind() {
+                if matches!(name, "read_file" | "edit_file")
+                    && let Some(path) = input.get("path").and_then(|p| p.as_str())
+                {
+                    self.calls.insert(id.to_string(), cwd.join(path));
+                }
+            } else if block.block_type() == "tool_result"
+                && let Some(id) = block.0.get("tool_use_id").and_then(|i| i.as_str())
+                && let Some(path) = self.calls.remove(id)
+                && block.0.get("is_error").and_then(|e| e.as_bool()) != Some(true)
+            {
+                self.paths.retain(|p| p != &path);
+                self.paths.push(path);
+            }
+        }
+    }
+
+    /// The files touched, the most recently touched last.
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+/// What [`put_back`] found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PutBack {
+    /// The user message to continue with; `None` when there is nothing to carry.
+    pub message: Option<MessageParam>,
+    /// The files carried with their contents, newest first.
+    pub read: Vec<PathBuf>,
+    /// The files carried as a path only, newest first.
+    pub referenced: Vec<PathBuf>,
+}
+
+/// The message bringing back up to [`PUT_BACK_FILES`] of the `touched` files,
+/// most recently modified first, read from disk now. A file over
+/// [`PUT_BACK_MAX_TOKENS`] comes back as its path, whatever it holds. A file
+/// that is gone, is one of `carried`, is not a regular file, is not UTF-8 text
+/// at or under that size, or that `ctx` refuses is left out and takes no place.
+pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) -> PutBack {
+    let carried: Vec<PathBuf> = carried
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    let mut candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    for path in touched.paths().iter().rev() {
+        let Ok(resolved) = path
+            .to_str()
+            .ok_or(())
+            .and_then(|p| ctx.resolve_file(p).map_err(|_| ()))
+        else {
+            continue;
+        };
+        if carried.contains(&resolved) || candidates.iter().any(|(_, _, seen)| seen == &resolved) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&resolved)
+            && meta.is_file()
+            && let Ok(modified) = meta.modified()
+        {
+            candidates.push((modified, meta.len(), resolved));
+        }
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+
+    let mut back = PutBack::default();
+    let mut parts = Vec::new();
+    for (_, bytes, path) in candidates {
+        if back.read.len() + back.referenced.len() == PUT_BACK_FILES {
+            break;
+        }
+        let shown = ctx.display(&path);
+        if bytes > PUT_BACK_MAX_TOKENS * BYTES_PER_TOKEN {
+            parts.push(format!(
+                "{shown} was also read or edited; it is over {PUT_BACK_MAX_TOKENS} tokens, so \
+                 its contents are not here."
+            ));
+            back.referenced.push(path);
+        } else if let Ok(contents) = std::fs::read_to_string(&path) {
+            parts.push(format!("Contents of {shown}:\n\n{}", contents.trim_end()));
+            back.read.push(path);
+        }
+    }
+    if !parts.is_empty() {
+        back.message = Some(MessageParam {
+            role: Role::User,
+            content: vec![ContentBlock::text(format!(
+                "<recent-files>\nFiles read or edited earlier in this session, as they are on \
+                 disk now. They are context for the work, not the user's request.\n\n{}\n\
+                 </recent-files>",
+                parts.join("\n\n")
+            ))],
+        });
+    }
+    back
 }

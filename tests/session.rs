@@ -649,3 +649,43 @@ fn a_sessions_folder_that_cannot_be_read_is_an_error_for_continue() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(result.is_err());
 }
+
+fn file_call(id: &str, name: &str, path: &str) -> MessageParam {
+    MessageParam {
+        role: Role::Assistant,
+        content: vec![ContentBlock(
+            json!({ "type": "tool_use", "id": id, "name": name, "input": { "path": path } }),
+        )],
+    }
+}
+
+#[test]
+fn the_files_touched_survive_a_compaction_a_drop_and_a_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.append(&file_call("a", "read_file", "before_compact.rs"))
+        .unwrap();
+    log.append(&tool_result("a")).unwrap();
+    log.record_compact("the summary").unwrap();
+
+    log.append(&text(Role::User, "edit it")).unwrap();
+    log.append(&file_call("b", "edit_file", "before_drop.rs"))
+        .unwrap();
+    log.append(&tool_result("b")).unwrap();
+    log.drop_to(1).unwrap();
+
+    log.record_cwd("/moved").unwrap();
+    log.append(&file_call("c", "read_file", "after_move.rs"))
+        .unwrap();
+    log.append(&tool_result("c")).unwrap();
+
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(
+        loaded.touched.paths(),
+        [
+            Path::new("/work/project/before_compact.rs"),
+            Path::new("/work/project/before_drop.rs"),
+            Path::new("/moved/after_move.rs"),
+        ]
+    );
+}

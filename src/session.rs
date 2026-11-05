@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::api::{BlockKind, ContentBlock, MessageParam, Role};
 use crate::clearing::clear_before;
-use crate::compaction::compacted;
+use crate::compaction::{TouchedFiles, compacted};
 
 /// The format version written to new files; files with a higher one are refused.
 pub const FORMAT_VERSION: u32 = 5;
@@ -153,6 +153,9 @@ pub struct Loaded {
     /// The working folder the session last ran in: the last one recorded,
     /// else the meta's.
     pub cwd: String,
+    /// The files touched in every message written, those a compaction or a
+    /// drop took out of the history included.
+    pub touched: TouchedFiles,
 }
 
 /// Reads a session file. The first line must be the session's meta, of this
@@ -166,6 +169,7 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
     let mut prompt = None;
     let mut cwd = None;
     let mut skipped = 0;
+    let mut touched = TouchedFiles::default();
     for line in lines {
         let line = line?;
         if line.trim().is_empty() {
@@ -177,7 +181,11 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
         };
         match record["type"].as_str() {
             Some("message") => match serde_json::from_value(record["message"].clone()) {
-                Ok(message) => history.push(message),
+                Ok(message) => {
+                    let folder = cwd.as_ref().unwrap_or(&meta.cwd);
+                    touched.observe(&message, Path::new(folder));
+                    history.push(message);
+                }
                 Err(_) => skipped += 1,
             },
             Some("drop") => match record["keep"].as_u64() {
@@ -220,6 +228,7 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
         repair,
         prompt,
         cwd: cwd.unwrap_or_else(|| meta.cwd.clone()),
+        touched,
         meta,
     })
 }

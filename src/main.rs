@@ -16,7 +16,8 @@ use just_harness::api::{
 };
 use just_harness::clearing::{ClearPolicy, clear_before, plan};
 use just_harness::compaction::{
-    CompactPolicy, compacted, should_compact, summary, summary_request,
+    CompactGate, CompactGuard, CompactPolicy, TouchedFiles, compacted, put_back, summary,
+    summary_request,
 };
 use just_harness::memory::{INDEX_MAX_BYTES, INDEX_MAX_LINES, Settings, load_context, memory_dir};
 use just_harness::session::{
@@ -457,16 +458,29 @@ fn args() -> Result<Args, String> {
     Ok(parsed)
 }
 
-/// The session to write to, the history to start from, the prompt its
-/// requests carry (the one recorded in a resumed session, else `current`),
-/// and the folder a resumed session last ran in when that is not `cwd`.
+/// What [`open_session`] opened.
+struct OpenedSession {
+    /// The session to write to.
+    log: Log,
+    /// The history to start from.
+    history: Vec<MessageParam>,
+    /// The prompt its requests carry: the one recorded in a resumed session,
+    /// else `current`.
+    prompt: SessionPrompt,
+    /// The folder a resumed session last ran in, when that is not `cwd`.
+    moved_from: Option<String>,
+    /// The files a resumed session touched.
+    touched: TouchedFiles,
+}
+
+/// Opens the session `start` names, or a new one.
 fn open_session(
     start: &Start,
     root: &Path,
     dir: &Path,
     cwd: &Path,
     current: &SessionPrompt,
-) -> Result<(Log, Vec<MessageParam>, SessionPrompt, Option<String>), String> {
+) -> Result<OpenedSession, String> {
     let cwd_text = cwd.display().to_string();
     let shown = |path: &Path| printable(&path.display().to_string());
     let path = match start {
@@ -483,16 +497,17 @@ fn open_session(
                 meta.id,
                 shown(dir)
             );
-            return Ok((
-                Log::Pending {
+            return Ok(OpenedSession {
+                log: Log::Pending {
                     dir: dir.to_path_buf(),
                     meta,
                     prompt: current.clone(),
                 },
-                Vec::new(),
-                current.clone(),
-                None,
-            ));
+                history: Vec::new(),
+                prompt: current.clone(),
+                moved_from: None,
+                touched: TouchedFiles::default(),
+            });
         }
         Start::Continue => latest(root, &cwd_text)
             .map_err(|e| format!("{}: {}", shown(root), printable(&e.to_string())))?
@@ -557,7 +572,13 @@ fn open_session(
         printable(&loaded.meta.id),
         loaded.history.len()
     );
-    Ok((Log::Open(file), loaded.history, prompt, moved_from))
+    Ok(OpenedSession {
+        log: Log::Open(file),
+        history: loaded.history,
+        prompt,
+        moved_from,
+        touched: loaded.touched,
+    })
 }
 
 #[tokio::main]
@@ -599,7 +620,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Type a request. Ctrl-C cancels a running request; Ctrl-C or Ctrl-D at the prompt quits."
     );
-    let (mut log, mut history, prompt, mut moved_from) = open_session(
+    let OpenedSession {
+        mut log,
+        mut history,
+        prompt,
+        mut moved_from,
+        mut touched,
+    } = open_session(
         &args.start,
         &sessions_root(&home),
         &sessions_dir(&home, &cwd),
@@ -610,10 +637,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Whether the next turn starts by carrying the instruction files and the
     // memory index: in a new session, and after a compaction.
     let mut needs_context = history.is_empty();
+    // Whether the next turn also brings back recent files: after a compaction.
+    let mut needs_files = false;
     let mut allowed = HashSet::new();
     let mut cached: Option<(Usage, Instant)> = None;
     let clearing = ClearPolicy::default();
     let compacting = CompactPolicy::default();
+    let mut compact_guard = CompactGuard::default();
     // The prompt and reply of the last request of the last turn kept, in tokens.
     let mut last_prompt: Option<u64> = None;
     let mut lines = input_lines();
@@ -630,22 +660,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(tokens) = last_prompt
-            && should_compact(&history, &compacting, tokens)
-        {
-            let compaction = compact(&agent, &mut history, &mut log, tokens).await;
-            report_usage(&compaction.usages, &mut cached, args.cache);
-            cached = None;
-            match compaction.end {
-                Compacted::Done => {
-                    last_prompt = None;
-                    needs_context = true;
-                    use_prompt(&mut agent, &current, &current);
-                    log.record_prompt(&current);
+        match compact_guard.gate(&history, &compacting, last_prompt) {
+            CompactGate::Attempt { tokens } => {
+                let compaction = compact(&agent, &mut history, &mut log, tokens).await;
+                report_usage(&compaction.usages, &mut cached, args.cache);
+                cached = None;
+                match compaction.end {
+                    Compacted::Done => {
+                        compact_guard.compacted();
+                        last_prompt = None;
+                        needs_context = true;
+                        needs_files = true;
+                        use_prompt(&mut agent, &current, &current);
+                        log.record_prompt(&current);
+                    }
+                    Compacted::Kept => compact_guard.attempted(),
+                    Compacted::Cancelled => continue,
                 }
-                Compacted::Kept => {}
-                Compacted::Cancelled => continue,
             }
+            CompactGate::JustStopped => println!(
+                "[automatic compaction stopped: {} attempts in a row made no room, because a summary failed or the conversation was {} tokens or more right after one. \
+                 Requests over 100,000 tokens cost more. \
+                 It starts again once a turn ends below that size, or after quitting and resuming]",
+                compacting.max_attempts, compacting.trigger_tokens
+            ),
+            CompactGate::Wait | CompactGate::Stopped => {}
         }
         if let Some(boundary) = last_prompt.and_then(|tokens| plan(&history, &clearing, tokens)) {
             let cleared = clear_before(&mut history, boundary);
@@ -672,6 +711,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(message) = loaded.message {
                 log.append(&message);
                 history.push(message);
+            }
+            if std::mem::take(&mut needs_files) {
+                let back = put_back(&touched, &agent.context, &loaded.read);
+                for path in &back.read {
+                    println!("[put back {}]", printable(&path.display().to_string()));
+                }
+                for path in &back.referenced {
+                    println!(
+                        "[put back the path of {}, too large for its contents]",
+                        printable(&path.display().to_string())
+                    );
+                }
+                if let Some(message) = back.message {
+                    log.append(&message);
+                    history.push(message);
+                }
             }
         }
         if let Some(from) = moved_from.take() {
@@ -701,6 +756,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let usages = std::mem::take(&mut terminal.usages);
         last_prompt = usages.last().map(|(usage, _)| usage.history_tokens());
+        if let Some((usage, _)) = usages.first() {
+            compact_guard.first_request(usage.prompt_tokens(), &compacting);
+        }
+        for message in &history[before..] {
+            touched.observe(message, &cwd);
+        }
         let Some(result) = result else {
             last_prompt = None;
             history.truncate(before);

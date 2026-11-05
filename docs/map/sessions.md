@@ -28,7 +28,7 @@ Checked on 2026-10-29 against a local fake API: a new session's file had the `pr
 
 ## What is not in the file
 
-The `a` allow-for-the-session answers (see [agent-loop](agent-loop.md), Approval) start empty on resume, so a resumed session asks again. A session resumed from another working folder runs its tools in the new one; the REPL warns when `cwd` differs. Its recorded system prompt and project context still name the first folder and its memory folder; the `<working-folder>` message above tells the model where the file tools now work ([memory](memory.md)). The new folder's instruction files and memory index are not read. Paths, ids and errors read from a session file are printed through `printable`.
+The `a` allow-for-the-session answers (see [agent-loop](agent-loop.md), Approval) start empty on resume, so a resumed session asks again. The compaction attempt count starts over too. The files a session touched have no record of their own; `load` rebuilds them from the messages ([compaction](compaction.md)). A session resumed from another working folder runs its tools in the new one; the REPL warns when `cwd` differs. Its recorded system prompt and project context still name the first folder and its memory folder; the `<working-folder>` message above tells the model where the file tools now work ([memory](memory.md)). The new folder's instruction files and memory index are not read. Paths, ids and errors read from a session file are printed through `printable`.
 
 ## How messages reach the file
 
