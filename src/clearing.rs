@@ -10,7 +10,7 @@ pub const CLEARED: &str =
     "[Old tool result cleared to save context. Call the tool again if you need it.]";
 
 /// Stands in for an assistant message whose only blocks were thinking.
-const REASONING_CLEARED: &str = "[Earlier reasoning cleared.]";
+pub const REASONING_CLEARED: &str = "[Earlier reasoning cleared.]";
 
 /// When to clear, and how much.
 #[derive(Debug, Clone, PartialEq, Eq)]

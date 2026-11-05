@@ -552,3 +552,38 @@ fn config_from_lookup_reads_the_key_and_base_url_and_ignores_empty_values() {
     assert_eq!(default_url.base_url, "https://api.anthropic.com");
     assert!(matches!(missing, Err(ApiError::Config(_))));
 }
+
+#[test]
+fn a_prompt_too_long_is_told_from_other_refusals() {
+    let status = |status: u16, message: &str| ApiError::Status {
+        status,
+        body: serde_json::json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": message }
+        }),
+    };
+    assert!(status(400, "prompt is too long").is_prompt_too_long());
+    assert!(
+        status(400, "Prompt is too long: 1100000 tokens > 1000000 maximum").is_prompt_too_long()
+    );
+    assert!(!status(400, "messages: roles must alternate").is_prompt_too_long());
+    assert!(
+        !status(429, "prompt is too long").is_prompt_too_long(),
+        "only a refusal of the request itself"
+    );
+    assert!(
+        ApiError::Status {
+            status: 413,
+            body: serde_json::Value::Null
+        }
+        .is_prompt_too_long(),
+        "over the request size, whatever the body"
+    );
+    assert!(!ApiError::Transport("prompt is too long".into()).is_prompt_too_long());
+    assert!(
+        !ApiError::Stream {
+            body: serde_json::json!({"error": {"message": "prompt is too long"}})
+        }
+        .is_prompt_too_long()
+    );
+}

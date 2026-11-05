@@ -12,12 +12,13 @@ use just_harness::agent::{
     Agent, Approval, ApprovalRequest, Approver, DEFAULT_MAX_ITERATIONS, Observer, TurnEnd,
 };
 use just_harness::api::{
-    Client, ClientConfig, ContentBlock, MessageParam, Role, StopReason, Transport, Usage,
+    ApiError, Client, ClientConfig, ContentBlock, Message, MessageParam, Role, StopReason,
+    Transport, Usage,
 };
 use just_harness::clearing::{ClearPolicy, clear_before, plan};
 use just_harness::compaction::{
-    CompactGate, CompactGuard, CompactPolicy, TouchedFiles, compacted, put_back, summary,
-    summary_request,
+    CompactGate, CompactGuard, CompactPolicy, SHRINK_ATTEMPTS, TouchedFiles, compacted,
+    last_resort_summary_request, put_back, shrunk_summary_request, summary, summary_request,
 };
 use just_harness::memory::{
     ContextFile, INDEX_MAX_BYTES, INDEX_MAX_LINES, Settings, context_update, load_context,
@@ -294,6 +295,8 @@ enum Compacted {
     Kept,
     /// Ctrl-C; the line typed is not sent.
     Cancelled,
+    /// The history holds nothing to summarize.
+    Nothing,
 }
 
 struct Compaction {
@@ -302,38 +305,85 @@ struct Compaction {
     usages: Vec<(Usage, Instant)>,
 }
 
+/// Sends [`shrunk_summary_request`]s until one gives a summary, then
+/// [`last_resort_summary_request`]; `None` when `history` holds nothing to
+/// summarize.
+async fn send_shrunk<T: Transport>(
+    agent: &Agent<T>,
+    history: &[MessageParam],
+    terminal: &mut Terminal<'_>,
+) -> Option<Result<Message, ApiError>> {
+    shrunk_summary_request(history, 0)?;
+    for attempt in 0..SHRINK_ATTEMPTS {
+        let Some(messages) = shrunk_summary_request(history, attempt) else {
+            break;
+        };
+        if attempt == 1 {
+            println!("[too long still; the oldest messages are left out of the summary]");
+        }
+        match agent.send(messages, terminal).await {
+            Err(error)
+                if !matches!(
+                    error,
+                    ApiError::Status {
+                        status: 400 | 413,
+                        ..
+                    }
+                ) =>
+            {
+                return Some(Err(error));
+            }
+            Ok(message) if summary(&message).is_some() => return Some(Ok(message)),
+            _ => {}
+        }
+    }
+    println!("[too long still; asking for a summary of nothing, so the conversation is lost]");
+    Some(agent.send(last_resort_summary_request(), terminal).await)
+}
+
 /// Asks for a summary of `history` and, when one comes back, replaces the
-/// history with it and records that in the session file.
+/// history with it and records that in the session file. With `tokens`, the
+/// size of the last request, it sends the history as it is; without, the
+/// history was refused as too long, so it sends it shrunk.
 async fn compact<T: Transport>(
     agent: &Agent<T>,
     history: &mut Vec<MessageParam>,
     log: &mut Log,
-    tokens: u64,
+    tokens: Option<u64>,
 ) -> Compaction {
-    println!(
-        "[compacting {} message(s), about {tokens} tokens, into a summary]",
-        history.len()
-    );
+    match tokens {
+        Some(tokens) => println!(
+            "[compacting {} message(s), about {tokens} tokens, into a summary]",
+            history.len()
+        ),
+        None => println!("[the API refused the request as too long; trying to compact]"),
+    }
     let mut terminal = Terminal {
         log,
         usages: Vec::new(),
     };
     let result = tokio::select! {
-        result = agent.send(summary_request(history), &mut terminal) => Some(result),
+        result = async {
+            match tokens {
+                Some(_) => Some(agent.send(summary_request(history), &mut terminal).await),
+                None => send_shrunk(agent, history, &mut terminal).await,
+            }
+        } => Some(result),
         _ = tokio::signal::ctrl_c() => None,
     };
     let usages = std::mem::take(&mut terminal.usages);
     println!();
     let end = match result {
         None => {
-            println!("[compaction cancelled; your line was not sent]");
+            println!("[compaction cancelled]");
             Compacted::Cancelled
         }
-        Some(Err(error)) => {
+        Some(None) => Compacted::Nothing,
+        Some(Some(Err(error))) => {
             println!("[compaction failed: {error}; the conversation is kept whole]");
             Compacted::Kept
         }
-        Some(Ok(message)) => match summary(&message) {
+        Some(Some(Ok(message))) => match summary(&message) {
             Some(text) => {
                 if message.stop_reason == Some(StopReason::MaxTokens) {
                     println!("[the summary was cut at max_tokens]");
@@ -673,22 +723,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The prompt and reply of the last request of the last turn kept, in tokens.
     let mut last_prompt: Option<u64> = None;
     let mut lines = input_lines();
+    // A line refused as too long, to send again after the compaction.
+    let mut resend: Option<String> = None;
     loop {
-        print!("\n> ");
-        std::io::stdout().flush()?;
-        let line = tokio::select! {
-            line = lines.recv() => line,
-            _ = tokio::signal::ctrl_c() => None,
-        };
-        let Some(line) = line else {
-            break;
+        let retrying = resend.is_some();
+        let line = match resend.take() {
+            Some(line) => line,
+            None => {
+                print!("\n> ");
+                std::io::stdout().flush()?;
+                let line = tokio::select! {
+                    line = lines.recv() => line,
+                    _ = tokio::signal::ctrl_c() => None,
+                };
+                let Some(line) = line else {
+                    break;
+                };
+                line
+            }
         };
         if line.trim().is_empty() {
             continue;
         }
         match compact_guard.gate(&history, &compacting, last_prompt) {
             CompactGate::Attempt { tokens } => {
-                let compaction = compact(&agent, &mut history, &mut log, tokens).await;
+                let compaction = compact(&agent, &mut history, &mut log, Some(tokens)).await;
                 report_usage(&compaction.usages, &mut cached, args.cache);
                 cached = None;
                 match compaction.end {
@@ -700,8 +759,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         use_prompt(&mut agent, &current, &current);
                         log.record_prompt(&current);
                     }
-                    Compacted::Kept => compact_guard.attempted(),
-                    Compacted::Cancelled => continue,
+                    Compacted::Kept | Compacted::Nothing => compact_guard.attempted(),
+                    Compacted::Cancelled => {
+                        println!("[your line was not sent]");
+                        continue;
+                    }
                 }
             }
             CompactGate::JustStopped => println!(
@@ -778,7 +840,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let before = history.len();
         let message = MessageParam {
             role: Role::User,
-            content: vec![ContentBlock::text(line)],
+            content: vec![ContentBlock::text(line.clone())],
         };
         log.append(&message);
         history.push(message);
@@ -812,6 +874,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
         let failed = result.is_err();
+        let too_long = matches!(&result, Err(error) if error.is_prompt_too_long());
+        let ran_tools = history.len() > before + 1;
         match result {
             Ok(outcome) => match outcome.end {
                 TurnEnd::StoppedByUser => {
@@ -831,12 +895,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_prompt = None;
                 history.truncate(before);
                 log.drop_to(before);
-                println!("\n[error: {error}; this request was dropped from the conversation]");
+                if !too_long {
+                    println!("\n[error: {error}; this request was dropped from the conversation]");
+                }
             }
         }
         report_usage(&usages, &mut cached, args.cache);
         if failed {
             cached = None;
+        }
+        if too_long {
+            let fate = if ran_tools {
+                "[its tools had already run, so do not send your line as it was; send what is left of it]"
+            } else {
+                "[your line was not sent]"
+            };
+            if retrying {
+                println!("[still too long right after a compaction]");
+                println!("{fate}");
+                continue;
+            }
+            let compaction = compact(&agent, &mut history, &mut log, None).await;
+            report_usage(&compaction.usages, &mut cached, args.cache);
+            cached = None;
+            match compaction.end {
+                Compacted::Done => {
+                    compact_guard.compacted();
+                    needs_context = true;
+                    needs_files = true;
+                    use_prompt(&mut agent, &current, &current);
+                    log.record_prompt(&current);
+                    if ran_tools {
+                        println!("{fate}");
+                    } else {
+                        resend = Some(line);
+                    }
+                }
+                Compacted::Nothing => {
+                    history.clear();
+                    log.drop_to(0);
+                    needs_context = true;
+                    needs_files = true;
+                    use_prompt(&mut agent, &current, &current);
+                    log.record_prompt(&current);
+                    println!(
+                        "[too long, with nothing in the conversation to summarize; the instruction files are read again with your next line]"
+                    );
+                    println!("{fate}");
+                }
+                Compacted::Kept => {
+                    compact_guard.attempted();
+                    println!("{fate}");
+                }
+                Compacted::Cancelled => println!("{fate}"),
+            }
         }
     }
     Ok(())

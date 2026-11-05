@@ -25,6 +25,21 @@ impl ApiError {
             ApiError::Stream { .. } | ApiError::Protocol(_) | ApiError::Config(_) => false,
         }
     }
+
+    /// Whether the API refused the request for its size: a 413, or a 400
+    /// saying the prompt is too long.
+    pub fn is_prompt_too_long(&self) -> bool {
+        let ApiError::Status { status, body } = self else {
+            return false;
+        };
+        match status {
+            413 => true,
+            400 => body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.to_lowercase().contains("prompt is too long")),
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ApiError {

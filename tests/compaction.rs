@@ -4,8 +4,9 @@ use std::time::{Duration, SystemTime};
 
 use just_harness::api::{ContentBlock, Message, MessageParam, Role, StopReason, Usage};
 use just_harness::compaction::{
-    CompactGate, CompactGuard, CompactPolicy, PutBack, SUMMARY_PREFIX, SUMMARY_REQUEST,
-    TouchedFiles, compacted, put_back, should_compact, summary, summary_request,
+    CompactGate, CompactGuard, CompactPolicy, LEFT_OUT, PutBack, SUMMARY_PREFIX, SUMMARY_REQUEST,
+    TouchedFiles, compacted, last_resort_summary_request, put_back, should_compact,
+    shrunk_summary_request, summary, summary_request,
 };
 use just_harness::tools::ToolContext;
 use serde_json::json;
@@ -590,4 +591,203 @@ fn a_file_the_project_context_already_carries_takes_no_place() {
     assert_eq!(back.read, ["a", "b", "c", "d", "e"].map(|n| root.join(n)));
     let message = back.message.unwrap();
     assert!(!message_text(&message).contains("contents of CLAUDE.md"));
+}
+
+fn thinking() -> ContentBlock {
+    ContentBlock(json!({ "type": "thinking", "thinking": "reasoning", "signature": "c2ln" }))
+}
+
+fn assistant_calling(id: &str) -> MessageParam {
+    MessageParam {
+        role: Role::Assistant,
+        content: vec![
+            thinking(),
+            ContentBlock(json!({ "type": "tool_use", "id": id, "name": "shell", "input": {} })),
+        ],
+    }
+}
+
+fn long_result(id: &str) -> MessageParam {
+    MessageParam {
+        role: Role::User,
+        content: vec![ContentBlock::tool_result(id, "o".repeat(2_000), false)],
+    }
+}
+
+fn assistant(text: &str) -> MessageParam {
+    MessageParam {
+        role: Role::Assistant,
+        content: vec![thinking(), ContentBlock::text(text)],
+    }
+}
+
+fn all_text(messages: &[MessageParam]) -> String {
+    serde_json::to_string(messages).unwrap()
+}
+
+#[test]
+fn a_shrunk_summary_request_leaves_out_what_is_read_again_and_the_bulk() {
+    let history = vec![
+        user("<project-context>\nBIG INSTRUCTIONS\n</project-context>"),
+        user("first request"),
+        assistant_calling("a"),
+        long_result("a"),
+        assistant("first answer"),
+        user("<working-folder>\nMOVED\n</working-folder>"),
+        user("<project-context-update>\nBIG UPDATE\n</project-context-update>"),
+        user("<recent-files>\nBIG FILES\n</recent-files>"),
+        user("second request"),
+        assistant("second answer"),
+    ];
+    let request = shrunk_summary_request(&history, 0).unwrap();
+    let text = all_text(&request);
+    for gone in [
+        "BIG INSTRUCTIONS",
+        "MOVED",
+        "BIG UPDATE",
+        "BIG FILES",
+        "ooooo",
+        "reasoning",
+    ] {
+        assert!(!text.contains(gone), "{gone} should be gone");
+    }
+    for kept in [
+        "first request",
+        "first answer",
+        "second request",
+        "second answer",
+    ] {
+        assert!(text.contains(kept), "{kept} should be kept");
+    }
+    assert_eq!(request.last(), Some(&user(SUMMARY_REQUEST)));
+    assert!(text.contains("\"tool_use\"") && text.contains("\"tool_result\""));
+}
+
+#[test]
+fn a_user_message_merely_mentioning_a_carried_tag_is_kept() {
+    let history = vec![
+        user("what does <project-context> mean?"),
+        assistant("a tag"),
+    ];
+    let request = shrunk_summary_request(&history, 0).unwrap();
+    assert!(all_text(&request).contains("what does"));
+}
+
+#[test]
+fn only_messages_read_again_leave_nothing_to_summarize() {
+    let history = vec![user("<project-context>\nBIG\n</project-context>")];
+    assert_eq!(shrunk_summary_request(&history, 0), None);
+    assert_eq!(shrunk_summary_request(&[], 0), None);
+}
+
+#[test]
+fn a_reply_left_with_only_thinking_keeps_a_block() {
+    let history = vec![
+        user("hi"),
+        MessageParam {
+            role: Role::Assistant,
+            content: vec![thinking()],
+        },
+    ];
+    let request = shrunk_summary_request(&history, 0).unwrap();
+    assert!(!request[1].content.is_empty());
+    assert_eq!(request[1].content[0].block_type(), "text");
+}
+
+fn exchanges(n: usize) -> Vec<MessageParam> {
+    (0..n)
+        .flat_map(|i| {
+            let id = format!("call_{i}");
+            [
+                user(&format!("request {i}")),
+                assistant_calling(&id),
+                long_result(&id),
+                assistant(&format!("answer {i}")),
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn each_further_attempt_keeps_about_half_of_what_was_left_the_newest() {
+    let history = exchanges(8);
+    let kept = |attempt: u32| {
+        let request = shrunk_summary_request(&history, attempt).unwrap();
+        let text = all_text(&request);
+        (0..8)
+            .filter(|i| text.contains(&format!("request {i}\"")))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kept(0), (0..8).collect::<Vec<_>>());
+    assert_eq!(kept(1), (4..8).collect::<Vec<_>>());
+    assert_eq!(kept(2), (6..8).collect::<Vec<_>>());
+    assert_eq!(kept(3), [7]);
+
+    let first = &shrunk_summary_request(&history, 1).unwrap()[0];
+    assert_eq!(first, &user(LEFT_OUT));
+    assert!(!all_text(&shrunk_summary_request(&history, 0).unwrap()).contains(LEFT_OUT));
+}
+
+#[test]
+fn nothing_further_can_be_left_out_of_one_exchange() {
+    let history = exchanges(1);
+    assert!(shrunk_summary_request(&history, 0).is_some());
+    assert_eq!(shrunk_summary_request(&history, 1), None);
+}
+
+#[test]
+fn a_cut_never_parts_a_tool_call_from_its_result() {
+    for n in 1..=7 {
+        let history = exchanges(n);
+        for attempt in 0..5 {
+            let Some(request) = shrunk_summary_request(&history, attempt) else {
+                continue;
+            };
+            let mut open = Vec::new();
+            for message in &request {
+                for block in &message.content {
+                    if block.block_type() == "tool_use" {
+                        open.push(block.0["id"].as_str().unwrap().to_string());
+                    }
+                    if block.block_type() == "tool_result" {
+                        let id = block.0["tool_use_id"].as_str().unwrap();
+                        let at = open.iter().position(|o| o == id);
+                        assert!(at.is_some(), "a result with no call, {n} {attempt}");
+                        open.remove(at.unwrap());
+                    }
+                }
+            }
+            assert!(open.is_empty(), "a call with no result, {n} {attempt}");
+            assert_eq!(request[0].role, Role::User);
+        }
+    }
+}
+
+#[test]
+fn a_tail_of_tool_rounds_with_no_later_request_cannot_be_cut() {
+    // One request followed by many rounds has one boundary, at its start.
+    let mut history = vec![user("the only request")];
+    for i in 0..6 {
+        let id = format!("c{i}");
+        history.push(assistant_calling(&id));
+        history.push(long_result(&id));
+    }
+    assert_eq!(shrunk_summary_request(&history, 1), None);
+}
+
+#[test]
+fn a_users_line_opening_with_a_carried_tag_is_kept() {
+    let history = vec![
+        user("<working-folder> what does this tag mean?"),
+        assistant("a tag"),
+    ];
+    let request = shrunk_summary_request(&history, 0).unwrap();
+    assert!(all_text(&request).contains("what does this tag mean"));
+    assert_eq!(request[0].role, Role::User);
+}
+
+#[test]
+fn the_last_resort_asks_for_a_summary_of_nothing_kept() {
+    let request = last_resort_summary_request();
+    assert_eq!(request, vec![user(LEFT_OUT), user(SUMMARY_REQUEST)]);
 }

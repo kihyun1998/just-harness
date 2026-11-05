@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::api::{BlockKind, ContentBlock, Message, MessageParam, Role, StopReason};
+use crate::clearing::{REASONING_CLEARED, clear_before};
 use crate::tools::ToolContext;
 
 /// The user message appended to the history to ask for the summary.
@@ -136,6 +137,81 @@ pub fn summary_request(history: &[MessageParam]) -> Vec<MessageParam> {
         content: vec![ContentBlock::text(SUMMARY_REQUEST)],
     });
     messages
+}
+
+/// The tags opening the messages read again from disk after a compaction, or
+/// told again by the prompt it switches to.
+const CARRIED: [&str; 4] = [
+    "<project-context>",
+    "<project-context-update>",
+    "<recent-files>",
+    "<working-folder>",
+];
+
+/// What stands in for the messages a [`shrunk_summary_request`] left out.
+pub const LEFT_OUT: &str = "[earlier messages of this conversation were left out here, to fit]";
+
+/// The most attempts at a [`shrunk_summary_request`] for one compaction.
+pub const SHRINK_ATTEMPTS: u32 = 5;
+
+/// The messages that ask for a summary of `history` when it is too long to
+/// send: attempt 0 has no message of [`CARRIED`], no thinking and every tool
+/// result cleared, and each attempt after it keeps about half as much, the
+/// newest, from a user's request on. `None` when nothing is left to
+/// summarize, or nothing more can be left out.
+pub fn shrunk_summary_request(history: &[MessageParam], attempt: u32) -> Option<Vec<MessageParam>> {
+    let mut kept: Vec<MessageParam> = history.iter().filter(|m| !is_carried(m)).cloned().collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let len = kept.len();
+    clear_before(&mut kept, len);
+    for message in &mut kept {
+        message
+            .content
+            .retain(|b| !matches!(b.block_type(), "thinking" | "redacted_thinking"));
+        if message.content.is_empty() {
+            message.content.push(ContentBlock::text(REASONING_CLEARED));
+        }
+    }
+    if attempt == 0 {
+        return Some(summary_request(&kept));
+    }
+    let from = len - len.checked_shr(attempt).unwrap_or(0);
+    let start = (from..len).find(|&i| starts_a_request(&kept[i]))?;
+    let mut messages = vec![MessageParam {
+        role: Role::User,
+        content: vec![ContentBlock::text(LEFT_OUT)],
+    }];
+    messages.extend_from_slice(&kept[start..]);
+    Some(summary_request(&messages))
+}
+
+/// The messages that ask for a summary when no [`shrunk_summary_request`] got
+/// one: nothing of the conversation at all.
+pub fn last_resort_summary_request() -> Vec<MessageParam> {
+    summary_request(&[MessageParam {
+        role: Role::User,
+        content: vec![ContentBlock::text(LEFT_OUT)],
+    }])
+}
+
+fn is_carried(message: &MessageParam) -> bool {
+    message.role == Role::User
+        && matches!(message.content.as_slice(), [block] if matches!(
+            block.kind(),
+            BlockKind::Text(text) if CARRIED.iter().any(|tag| {
+                text.strip_prefix(tag).is_some_and(|rest| rest.starts_with('\n'))
+            })
+        ))
+}
+
+fn starts_a_request(message: &MessageParam) -> bool {
+    message.role == Role::User
+        && !message
+            .content
+            .iter()
+            .any(|block| block.block_type() == "tool_result")
 }
 
 /// The text blocks of the summary reply, joined. `None` when there is no
