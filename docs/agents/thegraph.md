@@ -14,4 +14,4 @@ A Rust coding-agent harness in the style of Claude Code, built to learn by build
 | Ollama Anthropic compatibility (`docs/api/anthropic-compatibility.mdx`) | how it works | its docs in the source tree — raw | binding, for the later local-model goal |
 | Claude Code docs (code.claude.com/docs) | how it works | the published docs, raw Markdown at `<page>.md` | the target behaviour |
 
-Claude Code's behaviour is the target: where it and codex or goose differ, follow Claude Code, and ask the maintainer before departing from it. codex and goose are examples of how to build it. The Messages API docs bind over all three, since they say what a request may be. Maintainer's call, 2026-10-29.
+Claude Code's behaviour is the target: where it and codex or goose differ, follow Claude Code, and ask the maintainer before departing from it. Where its docs do not settle a behaviour, measure the installed build for free: see `docs/agents/measuring.md`. codex and goose are examples of how to build it. The Messages API docs bind over all three, since they say what a request may be. Maintainer's call, 2026-10-29.
