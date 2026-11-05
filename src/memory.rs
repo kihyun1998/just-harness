@@ -23,7 +23,8 @@ pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// its "Project instructions" setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InstructionFiles {
-    /// The `CLAUDE.md` files, or the `AGENTS.md` files where a folder has none.
+    /// The `CLAUDE.md` files, or the `AGENTS.md` files when none of those
+    /// carries anything.
     #[default]
     ClaudeMdOrAgentsMd,
     /// Both, each folder's `CLAUDE.md` files first.
@@ -80,10 +81,85 @@ impl Settings {
 const PROJECT_CLAUDE: [&str; 3] = ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"];
 const PROJECT_AGENTS: [&str; 2] = ["AGENTS.md", ".claude/AGENTS.md"];
 
-/// The instruction files of the working folder `dir` that `mode` reads, in
-/// the order they are read.
-pub fn instruction_files(dir: &Path, mode: InstructionFiles) -> Vec<PathBuf> {
-    select(dir, &PROJECT_CLAUDE, &PROJECT_AGENTS, mode)
+/// The instruction files `mode` reads for the working folder `cwd`, from the
+/// top folder down to `cwd`.
+pub fn instruction_files(cwd: &Path, home: &Path, mode: InstructionFiles) -> Vec<PathBuf> {
+    project_files(cwd, home, mode)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// [`instruction_files`], each with the folder it was found in. Left out, and
+/// not counting: `home`'s own `.claude` folder, and above a worktree inside
+/// its repository, all but `CLAUDE.local.md`.
+fn project_files(cwd: &Path, home: &Path, mode: InstructionFiles) -> Vec<(PathBuf, PathBuf)> {
+    let home = home.canonicalize().ok();
+    let home_claude = home
+        .as_ref()
+        .and_then(|h| h.join(".claude").canonicalize().ok());
+    let checkout = checkout_above_worktree(cwd);
+    let mut folders: Vec<&Path> = cwd.ancestors().collect();
+    folders.reverse();
+    let existing = |names: &[&str]| -> Vec<Vec<(PathBuf, PathBuf)>> {
+        folders
+            .iter()
+            .map(|dir| {
+                let real = dir.canonicalize().ok();
+                let is_home = home.is_some() && real == home;
+                let is_home_claude = home_claude.is_some() && real == home_claude;
+                let above_worktree = match (&real, &checkout) {
+                    (Some(real), Some((main, worktree))) => {
+                        real.starts_with(main) && !real.starts_with(worktree)
+                    }
+                    _ => false,
+                };
+                names
+                    .iter()
+                    .filter(|_| !is_home_claude)
+                    .filter(|name| !(is_home && name.starts_with(".claude/")))
+                    .filter(|name| !above_worktree || **name == "CLAUDE.local.md")
+                    .map(|name| (dir.join(name), dir.to_path_buf()))
+                    .filter(|(path, _)| path.is_file())
+                    .collect()
+            })
+            .collect()
+    };
+    let claude = existing(&PROJECT_CLAUDE);
+    let any_claude = claude
+        .iter()
+        .flatten()
+        .any(|(path, dir)| carries(path, dir));
+    let agents = match mode {
+        InstructionFiles::ClaudeMdOrAgentsMd if any_claude => None,
+        InstructionFiles::ClaudeMd => None,
+        _ => Some(existing(&PROJECT_AGENTS)),
+    };
+    claude
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, mut files)| {
+            if let Some(agents) = &agents {
+                files.extend(agents[i].iter().cloned());
+            }
+            files
+        })
+        .collect()
+}
+
+/// Whether the file at `path`, found in `dir`, would be carried.
+fn carries(path: &Path, dir: &Path) -> bool {
+    read_confined(path, dir).is_ok_and(|(_, text)| !text.trim().is_empty())
+}
+
+/// The real paths of the main checkout and the worktree, when `cwd` is in a
+/// worktree whose main repository has a checkout.
+fn checkout_above_worktree(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let worktree = cwd.ancestors().find(|dir| dir.join(".git").exists())?;
+    let main = worktree_main(&worktree.join(".git"))?;
+    main.join(".git")
+        .is_dir()
+        .then_some((main, worktree.canonicalize().ok()?))
 }
 
 /// The user's own instruction files in `~/.just-harness/`.
@@ -106,7 +182,7 @@ fn select(dir: &Path, claude: &[&str], agents: &[&str], mode: InstructionFiles) 
     };
     let mut files = existing(claude);
     let read_agents = match mode {
-        InstructionFiles::ClaudeMdOrAgentsMd => files.is_empty(),
+        InstructionFiles::ClaudeMdOrAgentsMd => !files.iter().any(|path| carries(path, dir)),
         InstructionFiles::ClaudeMdAndAgentsMd => true,
         InstructionFiles::ClaudeMd => false,
     };
@@ -316,8 +392,8 @@ pub struct Loaded {
     pub skipped: Vec<(PathBuf, String)>,
 }
 
-/// Reads the user's and the working folder's instruction files, and the
-/// memory index in `memory` when there is a memory folder, into
+/// Reads the user's instruction files, those of the folders from the top down
+/// to the working folder, and the memory index in `memory` when there is a memory folder, into
 /// [`project_context`]. A file is left out, with the reason, when it cannot
 /// be read, is over [`MAX_FILE_BYTES`], is a `.env` file, or leads through
 /// a symlink out of the folder it was found in; a file reached under two
@@ -334,10 +410,10 @@ pub fn load_context(
     let user_dir = home.join(".just-harness");
     let candidates = user_files(home, mode)
         .into_iter()
-        .map(|p| (p, user_dir.as_path()))
-        .chain(instruction_files(cwd, mode).into_iter().map(|p| (p, cwd)));
+        .map(|p| (p, user_dir.clone()))
+        .chain(project_files(cwd, home, mode));
     for (path, dir) in candidates {
-        match read_confined(&path, dir) {
+        match read_confined(&path, &dir) {
             Ok((real, text)) => {
                 if !seen.contains(&real) {
                     seen.push(real);
