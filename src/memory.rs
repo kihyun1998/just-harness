@@ -1,9 +1,11 @@
 //! Project memory: the instruction files a person writes and the memory
 //! index the model keeps, read at the start of a session and handed to the
-//! model as one user message.
+//! model as one user message, and what differs from them when a session
+//! resumes.
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{ContentBlock, MessageParam, Role};
@@ -179,22 +181,19 @@ pub fn project_context(
 ) -> Option<MessageParam> {
     let mut parts = Vec::new();
     for (path, contents) in files {
-        parts.push(format!(
-            "Contents of {}:\n\n{}",
-            path.display(),
-            contents.trim_end()
-        ));
+        parts.push(file_part(path, contents));
     }
     if let Some((dir, index)) = memory
         && !index.trim().is_empty()
     {
-        parts.push(format!(
-            "Contents of {} (your memory index; the files it names are in {}):\n\n{}",
-            dir.join(INDEX).display(),
-            dir.display(),
-            index.trim_end()
-        ));
+        parts.push(index_part(dir, index));
     }
+    carrying(&parts)
+}
+
+/// The user message that carries `parts` as the project context; `None` when
+/// there are none.
+fn carrying(parts: &[String]) -> Option<MessageParam> {
     if parts.is_empty() {
         return None;
     }
@@ -210,11 +209,107 @@ pub fn project_context(
     })
 }
 
+fn file_part(path: &Path, contents: &str) -> String {
+    format!("Contents of {}:\n\n{}", path.display(), contents.trim_end())
+}
+
+fn index_part(dir: &Path, index: &str) -> String {
+    format!(
+        "Contents of {} (your memory index; the files it names are in {}):\n\n{}",
+        dir.join(INDEX).display(),
+        dir.display(),
+        index.trim_end()
+    )
+}
+
+/// One file as the project context carried it: its path as shown to the
+/// model, and an instruction file's text or the excerpt of the memory index,
+/// with no blank end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFile {
+    pub path: String,
+    pub text: String,
+}
+
+/// What [`context_update`] found.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ContextUpdate {
+    /// The user message to send; `None` when nothing differs.
+    pub message: Option<MessageParam>,
+    /// The files sent, in the order of `now`.
+    pub changed: Vec<String>,
+    /// The files no longer there, in the order of `earlier`.
+    pub gone: Vec<String>,
+}
+
+/// What differs between the `earlier` copies, `None` when there are none to
+/// compare with, and the files as they are `now`, path by path. With no
+/// earlier files the changed ones come as a first project context. `memory`
+/// is the memory folder of this run.
+pub fn context_update(
+    earlier: Option<&[ContextFile]>,
+    now: &[ContextFile],
+    memory: Option<&Path>,
+) -> ContextUpdate {
+    let earlier = earlier.unwrap_or_default();
+    let changed: Vec<&ContextFile> = now.iter().filter(|file| !earlier.contains(file)).collect();
+    let gone: Vec<String> = earlier
+        .iter()
+        .filter(|file| !now.iter().any(|current| current.path == file.path))
+        .map(|file| file.path.clone())
+        .collect();
+    if changed.is_empty() && gone.is_empty() {
+        return ContextUpdate::default();
+    }
+    let contents: Vec<String> = changed
+        .iter()
+        .map(|file| match memory {
+            Some(dir) if file.path == dir.join(INDEX).display().to_string() => {
+                index_part(dir, &file.text)
+            }
+            _ => file_part(Path::new(&file.path), &file.text),
+        })
+        .collect();
+    let message = if earlier.is_empty() {
+        carrying(&contents)
+    } else {
+        let mut parts = vec![if contents.is_empty() {
+            "Instruction files were re-read when this session resumed.".to_string()
+        } else {
+            "Instruction files were re-read when this session resumed; these differ from their \
+             earlier copies, each replaces its earlier copy, and the instructions carried above \
+             still apply:"
+                .to_string()
+        }];
+        parts.extend(contents);
+        if !gone.is_empty() {
+            parts.push(format!(
+                "Instructions no longer present: {}",
+                gone.join(", ")
+            ));
+        }
+        Some(MessageParam {
+            role: Role::User,
+            content: vec![ContentBlock::text(format!(
+                "<project-context-update>\n{}\n</project-context-update>",
+                parts.join("\n\n")
+            ))],
+        })
+    };
+    ContextUpdate {
+        message,
+        changed: changed.iter().map(|file| file.path.clone()).collect(),
+        gone,
+    }
+}
+
 /// What [`load_context`] read.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Loaded {
     /// The [`project_context`] message, when there was anything to carry.
     pub message: Option<MessageParam>,
+    /// What that message carries, file by file.
+    pub files: Vec<ContextFile>,
     /// The files read, the memory index included.
     pub read: Vec<PathBuf>,
     /// The files found and left out, each with the reason.
@@ -247,7 +342,9 @@ pub fn load_context(
                 if !seen.contains(&real) {
                     seen.push(real);
                     loaded.read.push(path.clone());
-                    files.push((path, text));
+                    if !text.trim().is_empty() {
+                        files.push((path, text));
+                    }
                 }
             }
             Err(why) => loaded.skipped.push((path, why)),
@@ -266,7 +363,23 @@ pub fn load_context(
             }
         }
     }
-    loaded.message = project_context(&files, memory.map(|dir| (dir, index_excerpt(&index))));
+    let excerpt = index_excerpt(&index);
+    loaded.files = files
+        .iter()
+        .map(|(path, text)| ContextFile {
+            path: path.display().to_string(),
+            text: text.trim_end().to_string(),
+        })
+        .collect();
+    if let Some(dir) = memory
+        && !excerpt.trim().is_empty()
+    {
+        loaded.files.push(ContextFile {
+            path: dir.join(INDEX).display().to_string(),
+            text: excerpt.trim_end().to_string(),
+        });
+    }
+    loaded.message = project_context(&files, memory.map(|dir| (dir, excerpt)));
     loaded
 }
 

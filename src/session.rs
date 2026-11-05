@@ -8,7 +8,9 @@
 //! `{"type":"compact","summary":<text>}`, which replaces the history with
 //! [`compacted`]`(summary)`, or `{"type":"prompt",...Prompt}`, the system
 //! prompt and tool definitions the requests carry from there on, or
-//! `{"type":"cwd","cwd":<folder>}`, the working folder it runs in from there on.
+//! `{"type":"cwd","cwd":<folder>}`, the working folder it runs in from there on,
+//! or `{"type":"context","files":[<ContextFile>]}`, the files the project
+//! context carries from there on.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -23,9 +25,10 @@ use serde_json::{Value, json};
 use crate::api::{BlockKind, ContentBlock, MessageParam, Role};
 use crate::clearing::clear_before;
 use crate::compaction::{TouchedFiles, compacted};
+use crate::memory::ContextFile;
 
 /// The format version written to new files; files with a higher one are refused.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// The first line of a session file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +128,11 @@ impl SessionLog {
         self.write_line(&line)
     }
 
+    /// Records the files the project context carries from here on.
+    pub fn record_context(&mut self, files: &[ContextFile]) -> std::io::Result<()> {
+        self.write_line(&json!({ "type": "context", "files": files }))
+    }
+
     /// Writes one line and syncs it to the disk.
     fn write_line(&mut self, line: &Value) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(line)?;
@@ -156,6 +164,10 @@ pub struct Loaded {
     /// The files touched in every message written, those a compaction or a
     /// drop took out of the history included.
     pub touched: TouchedFiles,
+    /// The files the project context last carried; `None` when none were
+    /// recorded since the session began or was last compacted, or a drop or a
+    /// cut took out messages from before the record.
+    pub context: Option<Vec<ContextFile>>,
 }
 
 /// Reads a session file. The first line must be the session's meta, of this
@@ -170,6 +182,8 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
     let mut cwd = None;
     let mut skipped = 0;
     let mut touched = TouchedFiles::default();
+    let mut context = None;
+    let mut context_at = 0;
     for line in lines {
         let line = line?;
         if line.trim().is_empty() {
@@ -189,7 +203,12 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
                 Err(_) => skipped += 1,
             },
             Some("drop") => match record["keep"].as_u64() {
-                Some(keep) => history.truncate(keep as usize),
+                Some(keep) => {
+                    history.truncate(keep as usize);
+                    if history.len() < context_at {
+                        context = None;
+                    }
+                }
                 None => skipped += 1,
             },
             Some("cwd") => match record["cwd"].as_str() {
@@ -201,8 +220,18 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
                 Err(_) => skipped += 1,
             },
             Some("compact") => match record["summary"].as_str() {
-                Some(summary) => history = compacted(summary),
+                Some(summary) => {
+                    history = compacted(summary);
+                    context = None;
+                }
                 None => skipped += 1,
+            },
+            Some("context") => match serde_json::from_value(record["files"].clone()) {
+                Ok(files) => {
+                    context = Some(files);
+                    context_at = history.len();
+                }
+                Err(_) => skipped += 1,
             },
             Some("clear") => match record["before"].as_u64() {
                 Some(before) => {
@@ -216,6 +245,9 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
     let cut_at = first_unanswered(&history);
     if let Some(at) = cut_at {
         history.truncate(at);
+        if at < context_at {
+            context = None;
+        }
     }
     let repair = results_for_trailing_calls(&history);
     if let Some(repair) = &repair {
@@ -229,6 +261,7 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
         prompt,
         cwd: cwd.unwrap_or_else(|| meta.cwd.clone()),
         touched,
+        context,
         meta,
     })
 }

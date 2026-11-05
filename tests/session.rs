@@ -5,6 +5,7 @@ use std::path::Path;
 use just_harness::api::{ContentBlock, MessageParam, Role};
 use just_harness::clearing::{CLEARED, clear_before};
 use just_harness::compaction::compacted;
+use just_harness::memory::ContextFile;
 use just_harness::session::{
     FORMAT_VERSION, Prompt, SessionLog, SessionMeta, find_by_id, latest, load, new_id, sessions_dir,
 };
@@ -688,4 +689,135 @@ fn the_files_touched_survive_a_compaction_a_drop_and_a_move() {
             Path::new("/moved/after_move.rs"),
         ]
     );
+}
+
+fn context_file(path: &str, text: &str) -> ContextFile {
+    ContextFile {
+        path: path.into(),
+        text: text.into(),
+    }
+}
+
+#[test]
+fn a_session_with_no_context_record_has_no_earlier_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.append(&text(Role::User, "hi")).unwrap();
+    assert_eq!(load(log.path()).unwrap().context, None);
+}
+
+#[test]
+fn the_last_context_record_comes_back_without_entering_the_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.record_context(&[context_file("/w/CLAUDE.md", "first")])
+        .unwrap();
+    log.append(&text(Role::User, "hi")).unwrap();
+    log.record_context(&[context_file("/w/CLAUDE.md", "second")])
+        .unwrap();
+
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(
+        loaded.context,
+        Some(vec![context_file("/w/CLAUDE.md", "second")])
+    );
+    assert_eq!(loaded.history, [text(Role::User, "hi")]);
+    assert_eq!(loaded.skipped, 0);
+}
+
+#[test]
+fn no_files_in_a_context_record_are_still_earlier_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.record_context(&[]).unwrap();
+    assert_eq!(load(log.path()).unwrap().context, Some(vec![]));
+}
+
+#[test]
+fn a_compaction_leaves_no_earlier_copies_until_the_next_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.record_context(&[context_file("/w/CLAUDE.md", "before")])
+        .unwrap();
+    log.record_compact("the summary").unwrap();
+    assert_eq!(load(log.path()).unwrap().context, None);
+
+    log.record_context(&[context_file("/w/CLAUDE.md", "after")])
+        .unwrap();
+    assert_eq!(
+        load(log.path()).unwrap().context,
+        Some(vec![context_file("/w/CLAUDE.md", "after")])
+    );
+}
+
+#[test]
+fn an_unreadable_context_record_is_skipped_and_keeps_the_copies_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.record_context(&[context_file("/w/CLAUDE.md", "good")])
+        .unwrap();
+    let path = log.path().to_path_buf();
+    drop(log);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"{\"type\":\"context\",\"files\":\"not a list\"}\n");
+    std::fs::write(&path, bytes).unwrap();
+
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.skipped, 1);
+    assert_eq!(
+        loaded.context,
+        Some(vec![context_file("/w/CLAUDE.md", "good")])
+    );
+}
+
+#[test]
+fn a_drop_past_the_message_a_context_record_followed_clears_the_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.append(&text(Role::User, "hi")).unwrap();
+    log.append(&text(Role::User, "the update")).unwrap();
+    log.record_context(&[context_file("/w/CLAUDE.md", "rule")])
+        .unwrap();
+
+    log.append(&text(Role::User, "a turn")).unwrap();
+    log.drop_to(2).unwrap();
+    assert!(
+        load(log.path()).unwrap().context.is_some(),
+        "the update is still in the history"
+    );
+
+    log.drop_to(1).unwrap();
+    assert_eq!(load(log.path()).unwrap().context, None);
+}
+
+#[test]
+fn a_cut_past_the_message_a_context_record_followed_clears_the_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.append(&tool_call("a")).unwrap();
+    log.append(&text(Role::User, "no result for the call"))
+        .unwrap();
+    log.append(&text(Role::User, "the update")).unwrap();
+    log.record_context(&[context_file("/w/CLAUDE.md", "rule")])
+        .unwrap();
+
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(loaded.cut_at, Some(0));
+    assert_eq!(loaded.context, None);
+}
+
+#[test]
+fn a_cut_before_a_later_context_record_keeps_the_copies_it_leaves_standing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    log.append(&text(Role::User, "the context")).unwrap();
+    log.record_context(&[context_file("/w/CLAUDE.md", "rule")])
+        .unwrap();
+    log.append(&tool_call("a")).unwrap();
+    log.append(&text(Role::User, "no result for the call"))
+        .unwrap();
+
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(loaded.cut_at, Some(1));
+    assert!(loaded.context.is_some());
 }

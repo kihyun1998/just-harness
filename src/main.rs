@@ -19,7 +19,10 @@ use just_harness::compaction::{
     CompactGate, CompactGuard, CompactPolicy, TouchedFiles, compacted, put_back, summary,
     summary_request,
 };
-use just_harness::memory::{INDEX_MAX_BYTES, INDEX_MAX_LINES, Settings, load_context, memory_dir};
+use just_harness::memory::{
+    ContextFile, INDEX_MAX_BYTES, INDEX_MAX_LINES, Settings, context_update, load_context,
+    memory_dir,
+};
 use just_harness::session::{
     FORMAT_VERSION, Prompt as SessionPrompt, SessionLog, SessionMeta, find_by_id, latest, load,
     new_id, now_secs, sessions_dir, sessions_root,
@@ -386,6 +389,10 @@ impl Log {
         self.write(|file| file.record_compact(summary));
     }
 
+    fn record_context(&mut self, files: &[ContextFile]) {
+        self.write(|file| file.record_context(files));
+    }
+
     fn record_clear(&mut self, before: usize) {
         self.write(|file| file.record_clear(before));
     }
@@ -458,6 +465,17 @@ fn args() -> Result<Args, String> {
     Ok(parsed)
 }
 
+/// Says which files were found and left out of the project context, and why.
+fn report_skipped(skipped: &[(PathBuf, String)]) {
+    for (path, why) in skipped {
+        println!(
+            "[not loaded {}: {}]",
+            printable(&path.display().to_string()),
+            printable(why)
+        );
+    }
+}
+
 /// What [`open_session`] opened.
 struct OpenedSession {
     /// The session to write to.
@@ -471,6 +489,8 @@ struct OpenedSession {
     moved_from: Option<String>,
     /// The files a resumed session touched.
     touched: TouchedFiles,
+    /// The files a resumed session's project context last carried, when recorded.
+    context: Option<Vec<ContextFile>>,
 }
 
 /// Opens the session `start` names, or a new one.
@@ -507,6 +527,7 @@ fn open_session(
                 prompt: current.clone(),
                 moved_from: None,
                 touched: TouchedFiles::default(),
+                context: None,
             });
         }
         Start::Continue => latest(root, &cwd_text)
@@ -578,6 +599,7 @@ fn open_session(
         prompt,
         moved_from,
         touched: loaded.touched,
+        context: loaded.context,
     })
 }
 
@@ -626,6 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prompt,
         mut moved_from,
         mut touched,
+        context: earlier_context,
     } = open_session(
         &args.start,
         &sessions_root(&home),
@@ -639,6 +662,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut needs_context = history.is_empty();
     // Whether the next turn also brings back recent files: after a compaction.
     let mut needs_files = false;
+    // Whether the next turn compares the instruction files and the memory
+    // index with their earlier copies: in a resumed session.
+    let mut needs_update = !needs_context;
     let mut allowed = HashSet::new();
     let mut cached: Option<(Usage, Instant)> = None;
     let clearing = ClearPolicy::default();
@@ -701,17 +727,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for path in &loaded.read {
                 println!("[loaded {}]", printable(&path.display().to_string()));
             }
-            for (path, why) in &loaded.skipped {
-                println!(
-                    "[not loaded {}: {}]",
-                    printable(&path.display().to_string()),
-                    printable(why)
-                );
-            }
+            report_skipped(&loaded.skipped);
             if let Some(message) = loaded.message {
                 log.append(&message);
                 history.push(message);
             }
+            log.record_context(&loaded.files);
             if std::mem::take(&mut needs_files) {
                 let back = put_back(&touched, &agent.context, &loaded.read);
                 for path in &back.read {
@@ -734,6 +755,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             log.append(&note);
             history.push(note);
             log.record_cwd(&cwd.display().to_string());
+        }
+        if std::mem::take(&mut needs_update) {
+            let loaded = load_context(&home, &cwd, memory.as_deref(), settings.instruction_files);
+            let update =
+                context_update(earlier_context.as_deref(), &loaded.files, memory.as_deref());
+            for path in &update.changed {
+                println!("[loaded {}]", printable(path));
+            }
+            for path in &update.gone {
+                println!("[no longer present {}]", printable(path));
+            }
+            report_skipped(&loaded.skipped);
+            if let Some(message) = update.message {
+                log.append(&message);
+                history.push(message);
+            }
+            if earlier_context.as_deref() != Some(loaded.files.as_slice()) {
+                log.record_context(&loaded.files);
+            }
         }
         let before = history.len();
         let message = MessageParam {

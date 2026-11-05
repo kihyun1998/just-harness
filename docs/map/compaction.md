@@ -66,7 +66,7 @@ Checked on 2026-11-05 against a local fake API, running the binary:
 ## Known holes
 
 - **Every request refused.** A refused request has no usage, so the gate answers `Wait`, and after the stop nothing brings compaction back, a resume included (#19). Against a local fake API on 2026-11-05: after the stop, with every request answered by a 400, two lines after `--continue` both failed and sent no summary request. Whether the real API answers an oversized prompt with a 400 was not probed.
-- **A crash right after the `compact` record.** `needs_context` and `needs_files` live in memory, so a process that dies before the next message is written resumes on the summary alone, until the next compaction. The window is the synchronous code between the two writes; its length was not measured. With a `compact` record added to a session file by hand, `--continue` in a folder with a `CLAUDE.md` sent the summary and the line. Maintainer's call (2026-11-05): recorded here, not filed; a fix would change the session format.
+- **A crash right after the `compact` record.** `needs_files` lives in memory, so a process that dies before the next message is written resumes without the recent files, until the next compaction. The window is the synchronous code between the two writes; its length was not measured. Maintainer's call (2026-11-05): recorded here, not filed; a fix would change the session format. The project context does come back: with a `compact` record added to a session file by hand, `--continue` sends the summary, a `<project-context>` with every file, and the line ([sessions](sessions.md)).
 
 ## Not built
 
