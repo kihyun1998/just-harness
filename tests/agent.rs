@@ -1182,3 +1182,76 @@ async fn removing_a_block_removes_the_thinking_after_it_and_keeps_the_thinking_b
     assert_eq!(sent["messages"][3]["content"][0]["text"], "seen");
     assert_eq!(sent["messages"][4]["content"][0]["type"], "text");
 }
+
+#[tokio::test]
+async fn a_refusal_naming_its_block_takes_out_that_one() {
+    let transport = FakeTransport::new()
+        .respond(
+            400,
+            vec![&refusal(
+                "messages.2.content.0.tool_result.content.0.document.source.base64.data: The PDF specified was not valid.",
+            )],
+        )
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = agent_on(&transport);
+    let mut both = tool_call("bad");
+    both.content.push(ContentBlock(
+        json!({ "type": "tool_use", "id": "good", "name": "read_file", "input": { "path": "b" } }),
+    ));
+    let mut history = vec![
+        user("read both"),
+        both,
+        MessageParam {
+            role: Role::User,
+            content: vec![
+                ContentBlock::tool_result_blocks("bad", vec![document()], false),
+                ContentBlock::tool_result_blocks("good", vec![document()], false),
+            ],
+        },
+    ];
+
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    assert_eq!(transport.requests().len(), 2);
+    let sent = sent_body(&transport, 1);
+    assert_eq!(
+        sent["messages"][2]["content"][0]["content"][0]["type"],
+        "text"
+    );
+    assert_eq!(
+        sent["messages"][2]["content"][1]["content"][0]["type"],
+        "document"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_naming_a_place_without_its_kind_of_block_takes_the_newest() {
+    let transport = FakeTransport::new()
+        .respond(
+            400,
+            vec![&refusal(
+                "messages.9.content.0.image.source: Could not process image",
+            )],
+        )
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = agent_on(&transport);
+    let mut history = vec![
+        user("look"),
+        tool_call("t1"),
+        result_of("t1", vec![image(DATA)]),
+    ];
+
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let sent = sent_body(&transport, 1);
+    assert_eq!(
+        sent["messages"][2]["content"][0]["content"][0]["type"],
+        "text"
+    );
+}

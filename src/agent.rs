@@ -7,7 +7,7 @@ use crate::api::{
     ApiError, BlockKind, Client, ContentBlock, CreateMessageRequest, Message, MessageParam, Role,
     StopReason, Transport, Usage,
 };
-use crate::clearing::{RemovedBlock, remove_newest_block, removed_text};
+use crate::clearing::{RemovedBlock, remove_refused_block, removed_text};
 use crate::tools::{ToolContext, ToolOutput, ToolSet};
 
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
@@ -194,8 +194,9 @@ impl<T: Transport> Agent<T> {
                 Ok(message) => return Ok(message),
                 Err(error) => error,
             };
-            let removed = error.refused_block().and_then(|(kind, reason)| {
-                remove_newest_block(history, kind, &removed_text(kind, &reason))
+            let removed = error.refused_block().and_then(|refused| {
+                let text = removed_text(refused.kind, &refused.reason);
+                remove_refused_block(history, refused.kind, refused.place, &text)
             });
             match removed {
                 Some(removed) => observer.on_block_removed(&removed),

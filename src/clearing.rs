@@ -1,5 +1,5 @@
-//! Clearing old tool results from the history, and the thinking blocks that
-//! clearing invalidates.
+//! Clearing old tool results from the history, replacing a block the API
+//! refused, and the thinking blocks either invalidates.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -149,14 +149,61 @@ pub fn removed_text(kind: &str, reason: &str) -> String {
     )
 }
 
-/// Puts `text` in the place of the newest block of `kind` in a user message,
-/// as [`replace_block`] does. `None` when there is none.
+/// Puts `text` in the place of the block of `kind` at `place`, or of the
+/// newest block of `kind` in a user message when `place` holds none, as
+/// [`replace_block`] does. `None` when there is none.
+pub fn remove_refused_block(
+    history: &mut [MessageParam],
+    kind: &str,
+    place: Option<(usize, usize, Option<usize>)>,
+    text: &str,
+) -> Option<RemovedBlock> {
+    let found = place
+        .filter(|&place| holds(history, place, kind))
+        .or_else(|| newest(history, kind))?;
+    let removed = RemovedBlock {
+        message: found.0,
+        block: found.1,
+        nested: found.2,
+        text: text.to_string(),
+    };
+    replace_block(history, &removed);
+    Some(removed)
+}
+
+/// [`remove_refused_block`] with no place named.
 pub fn remove_newest_block(
     history: &mut [MessageParam],
     kind: &str,
     text: &str,
 ) -> Option<RemovedBlock> {
-    let found = history
+    remove_refused_block(history, kind, None, text)
+}
+
+fn holds(
+    history: &[MessageParam],
+    (message, block, nested): (usize, usize, Option<usize>),
+    kind: &str,
+) -> bool {
+    let Some(found) = history
+        .get(message)
+        .filter(|m| m.role == Role::User)
+        .and_then(|m| m.content.get(block))
+    else {
+        return false;
+    };
+    match nested {
+        Some(n) => found
+            .0
+            .get("content")
+            .and_then(|c| c.get(n))
+            .is_some_and(|b| b["type"] == kind),
+        None => found.block_type() == kind,
+    }
+}
+
+fn newest(history: &[MessageParam], kind: &str) -> Option<(usize, usize, Option<usize>)> {
+    history
         .iter()
         .enumerate()
         .rev()
@@ -175,15 +222,7 @@ pub fn remove_newest_block(
                     let n = nested.iter().rposition(|inner| inner["type"] == kind)?;
                     Some((m, b, Some(n)))
                 })
-        })?;
-    let removed = RemovedBlock {
-        message: found.0,
-        block: found.1,
-        nested: found.2,
-        text: text.to_string(),
-    };
-    replace_block(history, &removed);
-    Some(removed)
+        })
 }
 
 /// Applies `removed` to `history`, and removes every thinking block after the

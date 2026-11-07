@@ -8,7 +8,7 @@ mod transport;
 mod types;
 
 pub use client::{API_VERSION, Client, ClientConfig, DEFAULT_BASE_URL};
-pub use error::ApiError;
+pub use error::{ApiError, RefusedBlock};
 pub use transport::{
     BodyStream, CONNECT_TIMEOUT, HttpRequest, HttpResponse, READ_TIMEOUT, ReqwestTransport,
     Transport,

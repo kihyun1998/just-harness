@@ -41,9 +41,8 @@ impl ApiError {
         }
     }
 
-    /// The kind of content block a 400 says the API could not process,
-    /// `image` or `document`, and the reason it gives without the block's path.
-    pub fn refused_block(&self) -> Option<(&'static str, String)> {
+    /// What a 400 says about a content block the API could not process.
+    pub fn refused_block(&self) -> Option<RefusedBlock> {
         let ApiError::Status { status: 400, body } = self else {
             return None;
         };
@@ -59,12 +58,39 @@ impl ApiError {
         } else {
             return None;
         };
-        let reason = match message.split_once(": ") {
-            Some((path, reason)) if path.starts_with("messages.") => reason,
-            _ => message,
+        let (place, reason) = match message.split_once(": ") {
+            Some((path, reason)) if path.starts_with("messages.") => (block_place(path), reason),
+            _ => (None, message),
         };
-        Some((kind, reason.to_string()))
+        Some(RefusedBlock {
+            kind,
+            reason: reason.to_string(),
+            place,
+        })
     }
+}
+
+/// A content block the API could not process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedBlock {
+    /// `image` or `document`.
+    pub kind: &'static str,
+    /// The reason the API gives, without the block's path.
+    pub reason: String,
+    /// The message, the block in it and the block inside a tool result, when
+    /// the API names them.
+    pub place: Option<(usize, usize, Option<usize>)>,
+}
+
+/// The place `messages.<m>.content.<b>[.tool_result.content.<n>]...` names.
+fn block_place(path: &str) -> Option<(usize, usize, Option<usize>)> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let number = |i: usize| parts.get(i)?.parse::<usize>().ok();
+    let nested = match (parts.get(4), parts.get(5)) {
+        (Some(&"tool_result"), Some(&"content")) => Some(number(6)?),
+        _ => None,
+    };
+    Some((number(1)?, number(3)?, nested))
 }
 
 impl std::fmt::Display for ApiError {

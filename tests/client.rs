@@ -598,8 +598,17 @@ fn a_refusal_for_size_is_not_a_refused_block_whatever_it_mentions() {
         error("prompt is too long: 200000 tokens of images").refused_block(),
         None
     );
-    assert_eq!(
-        error("Could not process image").refused_block(),
-        Some(("image", "Could not process image".to_string()))
-    );
+    let refused = error("Could not process image").refused_block().unwrap();
+    assert_eq!((refused.kind, refused.place), ("image", None));
+    let refused = error(
+        "messages.4.content.1.tool_result.content.2.image.source.base64: image exceeds 5 MB maximum",
+    )
+    .refused_block()
+    .unwrap();
+    assert_eq!(refused.reason, "image exceeds 5 MB maximum");
+    assert_eq!(refused.place, Some((4, 1, Some(2))));
+    let refused = error("messages.0.content.3.image.source: Could not process image")
+        .refused_block()
+        .unwrap();
+    assert_eq!(refused.place, Some((0, 3, None)));
 }
