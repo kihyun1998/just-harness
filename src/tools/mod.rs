@@ -16,14 +16,20 @@ mod search;
 mod shell;
 
 pub use edit::EditFile;
-pub use read::ReadFile;
+pub use read::{FileKind, ReadFile, file_kind};
 pub use search::Search;
 pub use shell::Shell;
 
-/// What a tool call returns: the text for the model, and whether it failed.
+/// What a tool call returns: what it says, and whether it failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
+    /// The result for the model and the terminal. With [`blocks`](Self::blocks)
+    /// it is for the terminal alone.
     pub content: String,
+    /// When not empty, the result for the model in place of `content`.
+    pub blocks: Vec<api::ContentBlock>,
+    /// Text for the model that follows every result of the reply.
+    pub after: Option<String>,
     pub is_error: bool,
 }
 
@@ -31,6 +37,8 @@ impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            blocks: Vec::new(),
+            after: None,
             is_error: false,
         }
     }
@@ -38,7 +46,18 @@ impl ToolOutput {
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            blocks: Vec::new(),
+            after: None,
             is_error: true,
+        }
+    }
+
+    /// This output as the `tool_result` answering the call `tool_use_id`.
+    pub fn to_result(&self, tool_use_id: &str) -> api::ContentBlock {
+        if self.blocks.is_empty() {
+            api::ContentBlock::tool_result(tool_use_id, self.content.clone(), self.is_error)
+        } else {
+            api::ContentBlock::tool_result_blocks(tool_use_id, self.blocks.clone(), self.is_error)
         }
     }
 }

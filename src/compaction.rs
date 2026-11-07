@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::api::{BlockKind, ContentBlock, Message, MessageParam, Role, StopReason};
 use crate::clearing::{REASONING_CLEARED, clear_before};
-use crate::tools::ToolContext;
+use crate::tools::{FileKind, ToolContext, file_kind};
 
 /// The user message appended to the history to ask for the summary.
 pub const SUMMARY_REQUEST: &str = "The conversation is about to be compacted: everything above \
@@ -300,8 +300,9 @@ pub struct PutBack {
 /// The message bringing back up to [`PUT_BACK_FILES`] of the `touched` files,
 /// most recently modified first, read from disk now. A file over
 /// [`PUT_BACK_MAX_TOKENS`] comes back as its path, whatever it holds. A file
-/// that is gone, is one of `carried`, is not a regular file, is not UTF-8 text
-/// at or under that size, or that `ctx` refuses is left out and takes no place.
+/// that is gone, is one of `carried`, is not a regular file, is an image, is
+/// not UTF-8 text at or under that size, or that `ctx` refuses is left out and
+/// takes no place.
 pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) -> PutBack {
     let carried: Vec<PathBuf> = carried
         .iter()
@@ -321,6 +322,7 @@ pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) 
         }
         if let Ok(meta) = std::fs::metadata(&resolved)
             && meta.is_file()
+            && file_kind(&resolved) == FileKind::Text
             && let Ok(modified) = meta.modified()
         {
             candidates.push((modified, meta.len(), resolved));

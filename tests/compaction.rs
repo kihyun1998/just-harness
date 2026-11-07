@@ -791,3 +791,35 @@ fn the_last_resort_asks_for_a_summary_of_nothing_kept() {
     let request = last_resort_summary_request();
     assert_eq!(request, vec![user(LEFT_OUT), user(SUMMARY_REQUEST)]);
 }
+
+#[test]
+fn an_image_does_not_come_back_or_take_a_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut large = png.clone();
+    large.resize(20_001, 0);
+    write_aged(&root, "small.png", &png, 1);
+    write_aged(&root, "large.png", &large, 2);
+    write_aged(&root, "no_extension", &large, 3);
+    let mut calls = vec![("read_file", "small.png", false)];
+    calls.push(("read_file", "large.png", false));
+    calls.push(("read_file", "no_extension", false));
+    let names = ["a", "b", "c", "d", "e"];
+    for (age, name) in names.iter().enumerate() {
+        write_aged(&root, name, "text\n", 10 + age as u64);
+        calls.push(("read_file", name, false));
+    }
+    let touched = touched_by(&calls, &root);
+
+    let back = put_back(&touched, &ToolContext::new(&root).unwrap(), &[]);
+
+    let expected: Vec<PathBuf> = names.iter().map(|n| root.join(n)).collect();
+    assert_eq!(back.read, expected);
+    assert!(back.referenced.is_empty(), "{:?}", back.referenced);
+    let text = message_text(back.message.as_ref().unwrap());
+    assert!(
+        !text.contains(".png") && !text.contains("no_extension"),
+        "{text}"
+    );
+}

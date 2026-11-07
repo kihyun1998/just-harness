@@ -821,3 +821,38 @@ fn a_cut_before_a_later_context_record_keeps_the_copies_it_leaves_standing() {
     assert_eq!(loaded.cut_at, Some(1));
     assert!(loaded.context.is_some());
 }
+
+#[test]
+fn a_result_carrying_an_image_reads_back_as_it_was_written_and_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = ContentBlock(json!({
+        "type": "image",
+        "source": { "type": "base64", "media_type": "image/png", "data": "x".repeat(200) },
+    }));
+    let messages = vec![
+        text(Role::User, "look"),
+        tool_call("toolu_1"),
+        MessageParam {
+            role: Role::User,
+            content: vec![
+                ContentBlock::tool_result_blocks("toolu_1", vec![image], false),
+                ContentBlock::text("[Image: original 4000x3000, displayed at 2000x1500.]"),
+            ],
+        },
+        text(Role::Assistant, "Seen."),
+    ];
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    for message in &messages {
+        log.append(message).unwrap();
+    }
+
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(loaded.history, messages);
+    assert_eq!(loaded.skipped, 0);
+    assert_eq!(loaded.cut_at, None);
+
+    log.record_clear(3).unwrap();
+    let loaded = load(log.path()).unwrap();
+    assert_eq!(loaded.history[2].content[0].0["content"], json!(CLEARED));
+    assert_eq!(loaded.history[2].content[1], messages[2].content[1]);
+}

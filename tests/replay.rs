@@ -1,7 +1,7 @@
 //! Real Messages API exchanges, recorded by `examples/record.rs`, replayed
 //! through the client and the agent loop. Each test is set up from the
 //! recorded first request and checks that every request it sends equals the
-//! recorded one. Expected response values come from `plain_events`, a naive
+//! recorded one, sending the recorded tool definitions. Expected response values come from `plain_events`, a naive
 //! reading of each whole recorded body, not from the decoder that reads the
 //! same bytes chunk by chunk.
 
@@ -96,6 +96,7 @@ fn agent_from<'t>(
         })
         .collect();
     agent.extra = first.extra;
+    agent.tool_definitions = Some(first.tools);
     (agent, first.messages)
 }
 

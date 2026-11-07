@@ -11,7 +11,7 @@ pub enum Role {
 }
 
 /// One content block, kept whole as the JSON the API sent or will receive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ContentBlock(pub Value);
 
@@ -42,6 +42,23 @@ impl ContentBlock {
             "type": "tool_result",
             "tool_use_id": tool_use_id.into(),
             "content": content.into(),
+        });
+        if is_error {
+            block["is_error"] = Value::Bool(true);
+        }
+        Self(block)
+    }
+
+    /// A `tool_result` whose content is `blocks`.
+    pub fn tool_result_blocks(
+        tool_use_id: impl Into<String>,
+        blocks: Vec<ContentBlock>,
+        is_error: bool,
+    ) -> Self {
+        let mut block = json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id.into(),
+            "content": blocks,
         });
         if is_error {
             block["is_error"] = Value::Bool(true);

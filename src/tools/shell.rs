@@ -128,6 +128,8 @@ async fn run(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
         }
     }
     Ok(ToolOutput {
+        blocks: Vec::new(),
+        after: None,
         content: text,
         is_error,
     })

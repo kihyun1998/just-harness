@@ -238,3 +238,54 @@ fn nothing_is_planned_while_results_the_model_has_not_seen_end_the_history() {
     history.push(answer("s5", "Read c."));
     assert_eq!(plan(&history, &policy(1000, 1, 1), 1000), Some(8));
 }
+
+fn image_result(id: &str, data_bytes: usize) -> MessageParam {
+    MessageParam {
+        role: Role::User,
+        content: vec![ContentBlock::tool_result_blocks(
+            id,
+            vec![ContentBlock(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": "x".repeat(data_bytes) },
+            }))],
+            false,
+        )],
+    }
+}
+
+fn after_an_image(data_bytes: usize) -> Vec<MessageParam> {
+    vec![
+        user("look"),
+        call("t1", "s1"),
+        image_result("t1", data_bytes),
+        answer("s2", "seen"),
+        user("go on"),
+    ]
+}
+
+#[test]
+fn an_images_data_does_not_count_past_what_an_image_can_cost() {
+    let policy = ClearPolicy {
+        trigger_tokens: 10,
+        keep_results: 0,
+        min_cleared_bytes: 40_000,
+    };
+    // 4,784 visual tokens at 4 bytes each is 19,136 bytes, under the minimum
+    // however long the data is.
+    assert_eq!(plan(&after_an_image(100_000), &policy, 100), None);
+
+    let lower = ClearPolicy {
+        min_cleared_bytes: 19_136,
+        ..policy
+    };
+    assert_eq!(plan(&after_an_image(100_000), &lower, 100), Some(5));
+}
+
+#[test]
+fn an_image_is_cleared_with_its_result() {
+    let mut history = after_an_image(1_000);
+    let cleared = clear_before(&mut history, 5);
+    assert_eq!(cleared.results, 1);
+    assert_eq!(result_content(&history[2]), &json!(CLEARED));
+    assert!(!serde_json::to_string(&history).unwrap().contains("xxxx"));
+}

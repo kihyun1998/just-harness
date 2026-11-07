@@ -33,12 +33,17 @@ impl Default for ClearPolicy {
     }
 }
 
+/// The most bytes an `image` block's data counts for: the most visual tokens
+/// an image can cost, 4,784, at 4 bytes each.
+pub const MAX_IMAGE_BYTES: usize = 19_136;
+
 /// What one [`clear_before`] changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cleared {
     /// Tool results replaced with [`CLEARED`].
     pub results: usize,
-    /// The size of the content they had.
+    /// The size of the content they had, images counted as [`MAX_IMAGE_BYTES`]
+    /// at most.
     pub bytes: usize,
     /// Thinking and redacted thinking blocks removed.
     pub thinking: usize,
@@ -128,6 +133,18 @@ fn uncleared(block: &ContentBlock) -> Option<&Value> {
 fn content_bytes(content: &Value) -> usize {
     match content {
         Value::String(text) => text.len(),
-        other => other.to_string().len(),
+        other => other.to_string().len() - image_excess(other),
     }
+}
+
+/// How much of `content`'s JSON is image data past [`MAX_IMAGE_BYTES`] each.
+fn image_excess(content: &Value) -> usize {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "image")
+        .filter_map(|block| block["source"]["data"].as_str())
+        .map(|data| data.len().saturating_sub(MAX_IMAGE_BYTES))
+        .sum()
 }

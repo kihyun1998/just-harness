@@ -52,6 +52,24 @@ These are judgements, the maintainer's to reverse.
 
 Numbered lines, `DEFAULT_READ_LIMIT` lines by default, at most `MAX_READ_BYTES` per call (the rest is left for the next `offset`), lines past `MAX_LINE_CHARS` characters cut with a note. `str::lines` drops a trailing `\r`, so a CRLF file reads like an LF one.
 
+### What a file is read as
+
+`file_kind` decides by the extension, case aside: `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` are images, and an extension in `BINARY_EXTENSIONS` is refused. A file with no extension is an image when its first bytes say so, and text otherwise. Any other extension is text, so a PNG named `.txt` gets the `not UTF-8 text` error. Measured on Claude Code 2.1.319 in `-p` mode against a local fake API (2026-11-07), except that Claude Code shows such a file as garbled text with a notice about NUL bytes, where this keeps its error. `.zip`, `.bin`, `.heic`, `.dat` were measured refused and `.xlsx`, `.parquet` are in the tools-reference page; the rest of `BINARY_EXTENSIONS` is a judgement, not a measurement.
+
+### Images
+
+An image file's format comes from its bytes, not its extension, so a PNG named `.jpg` goes as `image/png`; a wrong `media_type` is what the name would have sent. Claude Code does the same on the same measurement. An image extension over something else is an error that names the likely cause, as is an empty file; both follow Claude Code's. A file that starts right and does not decode is an error too (codex decodes first for the same reason, `view_image.rs`), because the API would refuse the whole request and the REPL would drop the turn.
+
+- **Sizes (measured on Claude Code):** a long edge over 2000 px is scaled to 2000 (4000x3000 to 2000x1500, 2001x100 to 2000x100), and a text block after the results says the original size and the factor, in Claude Code's words. A long edge of exactly 2000 is unchanged, with no text. Claude Code gave 9000x100 as 1980x22 while saying 2000x22, so its rounding is not followed exactly.
+- **Why resize at all:** the API takes up to 8000x8000 px and 10 MB of base64 per image and downsizes by itself (vision page, read raw 2026-11-07), so this is not needed for a single image. Past 20 images in a request a stricter limit applies to all of them, 3000 px being safe by that page, and images from earlier turns count, so an unresized session would start failing at its 21st image. The session file also stays small. Maintainer's call (2026-11-07), shown against refusing only what is over the API's limits, with no new dependency: 111 to 134 unique crates, `image` and `base64` counted; build time and binary size not measured.
+- **The JPEG rule:** an image over `MAX_BYTES` (1,000,000) is sent as JPEG, quality 80 down to 20 until it fits, the last whatever its size. A PNG source tries PNG first when it was resized. Claude Code kept a noise PNG of 270 KB and converted one of 1.08 MB, and sent about 500 KB for 3 MB and 12 MB ones, so the limit lies between those two sizes; 1,000,000 and the qualities are a judgement, not a measurement. Claude Code also scaled the 12 MB one, 2000x2000, to 1932x1932; this keeps 2000.
+- **Transparency** is blended onto white when a JPEG is made: JPEG has no alpha, and dropping it leaves whatever colour transparent pixels hold, usually black, under dark text.
+- A file over 128 MB is refused without being read, in Claude Code's words (errors page). A path that is not a regular file is refused too.
+
+A `ToolOutput` with `blocks` sends them as the result's `content`, and `content` becomes only what the terminal shows, so base64 cannot reach the screen (checked against the fake API on 2026-11-07). A text block goes after all of a reply's results because the API requires text after `tool_result` blocks in a user message (handle-tool-calls page). Results with no blocks stay strings, byte for byte.
+
+Not checked: whether the API accepts these blocks from this harness. The key in `.env` still got a 401 on 2026-11-07 (`GET /v1/models`), so the shape rests on the docs and on it being what Claude Code sends. EXIF orientation is not applied, so a rotated photo that gets re-encoded loses its rotation; Claude Code's handling was not measured. Reading happens on the async task, so Ctrl-C waits for a decode to end.
+
 ## edit_file
 
 Exactly one match of `old_string`, else an error naming the match count and the first lines. When `old_string` has `\n` and only matches with `\r\n` (a CRLF file, text copied from `read_file`), both strings are turned to CRLF and the file keeps its line endings; codex preserves line endings the same way, goose does not. An empty `old_string` writes a file that does not exist or is empty, and refuses one with content, so nothing is overwritten. Not in the issue; the maintainer kept it on 2026-10-28 and asked for the empty-file case (shown against keeping it create-only or removing it).

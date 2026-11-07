@@ -212,6 +212,7 @@ impl<T: Transport> Agent<T> {
         approver: &mut impl Approver,
     ) -> Option<(MessageParam, bool)> {
         let mut results = Vec::new();
+        let mut after = Vec::new();
         let mut stopped = false;
         for block in &message.content {
             let BlockKind::ToolUse { id, name, input } = block.kind() else {
@@ -243,13 +244,12 @@ impl<T: Transport> Agent<T> {
                 self.tools.call(name, input, &self.context).await
             };
             observer.on_tool_result(name, &output);
-            results.push(ContentBlock::tool_result(
-                id,
-                output.content,
-                output.is_error,
-            ));
+            results.push(output.to_result(id));
+            after.extend(output.after.map(ContentBlock::text));
         }
-        (!results.is_empty()).then_some((
+        let no_calls = results.is_empty();
+        results.extend(after);
+        (!no_calls).then_some((
             MessageParam {
                 role: Role::User,
                 content: results,

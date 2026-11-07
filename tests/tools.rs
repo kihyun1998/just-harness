@@ -5,6 +5,8 @@ mod support;
 
 use std::path::Path;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use just_harness::agent::{Agent, AllowAll};
 use just_harness::api::Client;
 use just_harness::tools::{ToolContext, builtin};
@@ -755,4 +757,321 @@ fn a_folder_allowed_besides_the_working_folder_is_reachable_by_its_absolute_path
     );
     assert!(context.resolve_file("../memory/../other/b.txt").is_err());
     assert_eq!(context.allowed(), [canonical]);
+}
+
+/// The bytes of an opaque PNG; `noisy` ones do not compress.
+fn png(width: u32, height: u32, noisy: bool) -> Vec<u8> {
+    let mut seed = 1u32;
+    let image = image::RgbImage::from_fn(width, height, |_, _| {
+        if noisy {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let [r, g, b, _] = seed.to_le_bytes();
+            image::Rgb([r, g, b])
+        } else {
+            image::Rgb([128, 128, 128])
+        }
+    });
+    encode(&image::DynamicImage::ImageRgb8(image))
+}
+
+fn encode(image: &image::DynamicImage) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// Runs `read_file` on `path` in `root` and returns the user message that
+/// carries the result.
+async fn read_message(root: &Path, input: Value) -> Value {
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(&[("toolu_1", "read_file", input)], "tool_use")],
+        )
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = Agent::new(
+        Client::with_transport(config(), &transport),
+        "claude-haiku-5-5",
+        builtin(),
+        ToolContext::new(root).unwrap(),
+    );
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+    sent_body(&transport, 1)["messages"][2]["content"].clone()
+}
+
+fn decoded(source: &Value) -> Vec<u8> {
+    BASE64
+        .decode(source["data"].as_str().unwrap())
+        .expect("base64 data")
+}
+
+#[tokio::test]
+async fn read_file_returns_an_image_within_the_limits_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = png(4, 4, false);
+    std::fs::write(dir.path().join("small.png"), &bytes).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "small.png" })).await;
+
+    assert_eq!(
+        message,
+        json!([{
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": BASE64.encode(&bytes),
+                },
+            }],
+        }])
+    );
+}
+
+#[tokio::test]
+async fn read_file_tells_an_image_by_its_bytes_not_its_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["named.jpg", "no_extension", "UPPER.PNG"] {
+        std::fs::write(dir.path().join(name), png(4, 4, false)).unwrap();
+        let message = read_message(dir.path(), json!({ "path": name })).await;
+        let block = &message[0]["content"][0];
+        assert_eq!(block["type"], "image", "{name}");
+        assert_eq!(block["source"]["media_type"], "image/png", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn read_file_shrinks_a_long_edge_to_2000_and_says_so_after_the_results() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("wide.png"), png(4000, 3000, false)).unwrap();
+    std::fs::write(dir.path().join("edge.png"), png(2000, 100, false)).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "wide.png" })).await;
+
+    let source = &message[0]["content"][0]["source"];
+    assert_eq!(source["media_type"], "image/png");
+    let sent = image::load_from_memory(&decoded(source)).unwrap();
+    assert_eq!((sent.width(), sent.height()), (2000, 1500));
+    assert_eq!(
+        message[1],
+        json!({
+            "type": "text",
+            "text": "[Image: original 4000x3000, displayed at 2000x1500. Multiply coordinates by 2.00 to map to original image.]",
+        })
+    );
+    assert_eq!(message.as_array().unwrap().len(), 2);
+
+    let message = read_message(dir.path(), json!({ "path": "edge.png" })).await;
+    assert_eq!(
+        message.as_array().unwrap().len(),
+        1,
+        "2000 is within the limit"
+    );
+    let sent = image::load_from_memory(&decoded(&message[0]["content"][0]["source"])).unwrap();
+    assert_eq!((sent.width(), sent.height()), (2000, 100));
+}
+
+#[tokio::test]
+async fn read_file_rounds_the_scaled_edge_to_the_nearest_pixel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("just.png"), png(2001, 100, false)).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "just.png" })).await;
+
+    let sent = image::load_from_memory(&decoded(&message[0]["content"][0]["source"])).unwrap();
+    assert_eq!((sent.width(), sent.height()), (2000, 100));
+    assert_eq!(
+        message[1]["text"],
+        "[Image: original 2001x100, displayed at 2000x100. Multiply coordinates by 1.00 to map to original image.]"
+    );
+}
+
+#[tokio::test]
+async fn read_file_keeps_a_small_edge_at_one_pixel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("line.png"), png(9000, 1, false)).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "line.png" })).await;
+
+    let sent = image::load_from_memory(&decoded(&message[0]["content"][0]["source"])).unwrap();
+    assert_eq!((sent.width(), sent.height()), (2000, 1));
+}
+
+#[tokio::test]
+async fn read_file_sends_an_image_over_a_megabyte_as_jpeg_of_the_same_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = png(800, 800, true);
+    assert!(bytes.len() > 1_000_000, "{}", bytes.len());
+    std::fs::write(dir.path().join("noise.png"), &bytes).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "noise.png" })).await;
+
+    let source = &message[0]["content"][0]["source"];
+    assert_eq!(source["media_type"], "image/jpeg");
+    let sent = decoded(source);
+    assert!(sent.len() <= 1_000_000, "{}", sent.len());
+    let sent = image::load_from_memory_with_format(&sent, image::ImageFormat::Jpeg).unwrap();
+    assert_eq!((sent.width(), sent.height()), (800, 800));
+    assert_eq!(message.as_array().unwrap().len(), 1, "nothing was resized");
+}
+
+#[tokio::test]
+async fn read_file_keeps_an_image_of_at_most_a_megabyte_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = png(300, 300, true);
+    assert!(bytes.len() < 1_000_000);
+    std::fs::write(dir.path().join("noise.png"), &bytes).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "noise.png" })).await;
+
+    assert_eq!(decoded(&message[0]["content"][0]["source"]), bytes);
+}
+
+#[tokio::test]
+async fn read_file_puts_transparency_on_white_when_it_makes_a_jpeg() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut seed = 1u32;
+    let image = image::RgbaImage::from_fn(800, 800, |x, _| {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let [r, g, b, _] = seed.to_le_bytes();
+        if x < 400 {
+            image::Rgba([0, 0, 0, 0])
+        } else {
+            image::Rgba([r, g, b, 255])
+        }
+    });
+    let bytes = encode(&image::DynamicImage::ImageRgba8(image));
+    assert!(bytes.len() > 1_000_000, "{}", bytes.len());
+    std::fs::write(dir.path().join("clear.png"), bytes).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "clear.png" })).await;
+
+    let source = &message[0]["content"][0]["source"];
+    assert_eq!(source["media_type"], "image/jpeg");
+    let sent = image::load_from_memory(&decoded(source)).unwrap().to_rgb8();
+    let pixel = sent.get_pixel(100, 400).0;
+    assert!(pixel.iter().all(|&c| c > 240), "{pixel:?}");
+}
+
+#[tokio::test]
+async fn read_file_puts_every_result_before_the_text_after_them() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("wide.png"), png(4000, 10, false)).unwrap();
+    write(dir.path(), "a.txt", "alpha\n");
+    let transport = FakeTransport::new()
+        .respond(
+            200,
+            vec![&tool_reply(
+                &[
+                    ("t1", "read_file", json!({ "path": "wide.png" })),
+                    ("t2", "read_file", json!({ "path": "a.txt" })),
+                ],
+                "tool_use",
+            )],
+        )
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = Agent::new(
+        Client::with_transport(config(), &transport),
+        "claude-haiku-5-5",
+        builtin(),
+        ToolContext::new(dir.path()).unwrap(),
+    );
+    agent
+        .run_turn(&mut vec![user("go")], &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let message = &sent_body(&transport, 1)["messages"][2]["content"];
+    let kinds: Vec<&str> = message
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["tool_result", "tool_result", "text"]);
+}
+
+#[tokio::test]
+async fn read_file_refuses_what_is_not_the_image_its_name_says() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "login.png", "<html>log in</html>\n");
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "login.png" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("not a valid PNG/JPEG/GIF/WebP"), "{out}");
+
+    write(dir.path(), "empty.png", "");
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "empty.png" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("empty"), "{out}");
+
+    let mut cut = png(4, 4, false);
+    cut.truncate(30);
+    std::fs::write(dir.path().join("cut.png"), cut).unwrap();
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "cut.png" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("could not be decoded"), "{out}");
+}
+
+#[tokio::test]
+async fn read_file_refuses_an_image_file_over_128_megabytes_without_reading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(dir.path().join("huge.png")).unwrap();
+    file.set_len(128 * 1024 * 1024 + 1).unwrap();
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "huge.png" })).await;
+
+    assert!(err, "{out}");
+    assert!(out.contains("too large to read as an image"), "{out}");
+
+    file.set_len(128 * 1024 * 1024).unwrap();
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "huge.png" })).await;
+    assert!(err, "{out}");
+    assert!(
+        !out.contains("too large"),
+        "128 MB itself is allowed: {out}"
+    );
+}
+
+#[tokio::test]
+async fn read_file_refuses_a_binary_format_by_its_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.zip", "b.bin", "c.HEIC", "d.dat", "e.xlsx", "f.parquet"] {
+        // ASCII, so only the extension can be what refuses it.
+        write(dir.path(), name, "plain\n");
+        let (out, err) = call(dir.path(), "read_file", json!({ "path": name })).await;
+        assert!(err, "{name}: {out}");
+        assert!(out.contains("cannot read binary files"), "{name}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn read_file_still_reads_text_under_an_unknown_extension_or_none() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "notes.unknownext", "hello\n");
+    write(dir.path(), "README", "hi\n");
+    let (out, err) = call(
+        dir.path(),
+        "read_file",
+        json!({ "path": "notes.unknownext" }),
+    )
+    .await;
+    assert_eq!((out.as_str(), err), ("     1\thello", false));
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "README" })).await;
+    assert_eq!((out.as_str(), err), ("     1\thi", false));
+}
+
+#[tokio::test]
+async fn read_file_keeps_a_text_extension_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pic.txt"), png(4, 4, false)).unwrap();
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "pic.txt" })).await;
+
+    assert!(err, "{out}");
+    assert!(out.contains("not UTF-8 text"), "{out}");
 }

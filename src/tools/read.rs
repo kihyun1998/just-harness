@@ -1,15 +1,75 @@
+use std::io::Read;
+use std::path::Path;
+
 use serde_json::{Value, json};
 
 use super::{Tool, ToolContext, ToolFuture, ToolOutput, str_arg, u64_arg};
 use crate::api;
+
+mod image;
 
 pub const DEFAULT_READ_LIMIT: usize = 2000;
 /// The most bytes one read returns; lines past it are left for the next offset.
 pub const MAX_READ_BYTES: usize = 50_000;
 /// Lines longer than this many characters are cut.
 pub const MAX_LINE_CHARS: usize = 2000;
+/// The largest image file read.
+pub const MAX_IMAGE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Reads a UTF-8 text file as numbered lines.
+/// Extensions refused as binary formats.
+const BINARY_EXTENSIONS: &[&str] = &[
+    "7z", "a", "app", "avi", "bin", "bmp", "bz2", "class", "dat", "db", "deb", "dll", "dmg", "doc",
+    "docx", "dylib", "exe", "flac", "gz", "heic", "heif", "ico", "iso", "jar", "m4a", "mkv", "mov",
+    "mp3", "mp4", "o", "otf", "parquet", "ppt", "pptx", "pyc", "rar", "rpm", "so", "sqlite", "tar",
+    "tgz", "tif", "tiff", "ttf", "wasm", "wav", "webm", "woff", "woff2", "xls", "xlsx", "xz",
+    "zip",
+];
+
+/// What a file is read as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Text,
+    Image,
+    Binary,
+}
+
+/// What `path` is read as: by its extension, and by its first bytes when it
+/// has none.
+pub fn file_kind(path: &Path) -> FileKind {
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return if starts_as_image(path) {
+            FileKind::Image
+        } else {
+            FileKind::Text
+        };
+    };
+    let extension = extension.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => FileKind::Image,
+        other if BINARY_EXTENSIONS.contains(&other) => FileKind::Binary,
+        _ => FileKind::Text,
+    }
+}
+
+fn starts_as_image(path: &Path) -> bool {
+    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut start = [0u8; 12];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut filled = 0;
+    while filled < start.len() {
+        match file.read(&mut start[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => filled += n,
+        }
+    }
+    image::sniff(&start[..filled]).is_some()
+}
+
+/// Reads text files as numbered lines, and images as image blocks.
 pub struct ReadFile;
 
 impl Tool for ReadFile {
@@ -17,10 +77,11 @@ impl Tool for ReadFile {
         api::Tool {
             name: "read_file".into(),
             description: format!(
-                "Read a text file in the working folder. Lines come back numbered from 1, \
+                "Read a file in the working folder. Text comes back as lines numbered from 1, \
                  as `<number>\\t<line>`. Reads up to {DEFAULT_READ_LIMIT} lines unless \
                  `limit` says otherwise, and at most {MAX_READ_BYTES} bytes; use `offset` to \
-                 continue. Lines over {MAX_LINE_CHARS} characters are cut."
+                 continue. Lines over {MAX_LINE_CHARS} characters are cut. PNG, JPEG, GIF and \
+                 WebP images come back as images you can see, large ones scaled down."
             ),
             input_schema: json!({
                 "type": "object",
@@ -51,6 +112,11 @@ fn read(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
         .map(|l| l.max(1) as usize)
         .unwrap_or(DEFAULT_READ_LIMIT);
     let shown = ctx.display(&path);
+    match file_kind(&path) {
+        FileKind::Text => {}
+        FileKind::Image => return read_image(&path, &shown),
+        FileKind::Binary => return Err(binary_refusal(&path)),
+    }
     let bytes = std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{shown}: not UTF-8 text"))?;
     let lines: Vec<&str> = text.lines().collect();
@@ -85,6 +151,47 @@ fn read(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
         out.push(format!("[lines {offset}-{end} of {total}{more}]"));
     }
     Ok(ToolOutput::ok(out.join("\n")))
+}
+
+fn binary_refusal(path: &Path) -> String {
+    let extension = path.extension().unwrap_or_default().to_string_lossy();
+    format!(
+        "This tool cannot read binary files. The file appears to be a binary .{extension} file. \
+         Use a shell command or script that can read the format."
+    )
+}
+
+fn read_image(path: &Path, shown: &str) -> Result<ToolOutput, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "Cannot read this as an image: {shown} is not a regular file."
+        ));
+    }
+    if meta.len() > MAX_IMAGE_FILE_BYTES {
+        return Err(format!(
+            "File is too large to read as an image (the limit is 128MB): {shown}. If it is an \
+             image, resize it or export a smaller copy, then read that."
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
+    if bytes.is_empty() {
+        return Err(format!("Image file is empty: {shown}"));
+    }
+    let Some(format) = image::sniff(&bytes) else {
+        return Err(format!(
+            "File has an image extension but its content is not a valid PNG/JPEG/GIF/WebP: \
+             {shown}. This usually means a download saved an error or login page instead of the \
+             image."
+        ));
+    };
+    let prepared = image::prepare(&bytes, format).map_err(|e| format!("{shown}: {e}"))?;
+    Ok(ToolOutput {
+        content: format!("[image {shown}, {}x{}]", prepared.width, prepared.height),
+        blocks: vec![prepared.block],
+        after: prepared.note,
+        is_error: false,
+    })
 }
 
 fn cut(line: &str) -> String {
