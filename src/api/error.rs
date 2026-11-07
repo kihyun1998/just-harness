@@ -40,6 +40,31 @@ impl ApiError {
             _ => false,
         }
     }
+
+    /// The kind of content block a 400 says the API could not process,
+    /// `image` or `document`, and the reason it gives without the block's path.
+    pub fn refused_block(&self) -> Option<(&'static str, String)> {
+        let ApiError::Status { status: 400, body } = self else {
+            return None;
+        };
+        if self.is_prompt_too_long() {
+            return None;
+        }
+        let message = body["error"]["message"].as_str()?;
+        let lower = message.to_lowercase();
+        let kind = if lower.contains("image") {
+            "image"
+        } else if lower.contains("pdf") {
+            "document"
+        } else {
+            return None;
+        };
+        let reason = match message.split_once(": ") {
+            Some((path, reason)) if path.starts_with("messages.") => reason,
+            _ => message,
+        };
+        Some((kind, reason.to_string()))
+    }
 }
 
 impl std::fmt::Display for ApiError {

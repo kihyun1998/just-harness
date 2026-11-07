@@ -10,7 +10,8 @@
 //! prompt and tool definitions the requests carry from there on, or
 //! `{"type":"cwd","cwd":<folder>}`, the working folder it runs in from there on,
 //! or `{"type":"context","files":[<ContextFile>]}`, the files the project
-//! context carries from there on.
+//! context carries from there on, or `{"type":"block_removed",...RemovedBlock}`,
+//! a block taken out as [`replace_block`] does.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -23,12 +24,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{BlockKind, ContentBlock, MessageParam, Role};
-use crate::clearing::clear_before;
+use crate::clearing::{RemovedBlock, clear_before, replace_block};
 use crate::compaction::{TouchedFiles, compacted};
 use crate::memory::ContextFile;
 
 /// The format version written to new files; files with a higher one are refused.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The first line of a session file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +134,13 @@ impl SessionLog {
         self.write_line(&json!({ "type": "context", "files": files }))
     }
 
+    /// Records that a block was taken out of the history ([`replace_block`]).
+    pub fn record_block_removed(&mut self, removed: &RemovedBlock) -> std::io::Result<()> {
+        let mut line = serde_json::to_value(removed)?;
+        line["type"] = json!("block_removed");
+        self.write_line(&line)
+    }
+
     /// Writes one line and syncs it to the disk.
     fn write_line(&mut self, line: &Value) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(line)?;
@@ -231,6 +239,10 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
                     context = Some(files);
                     context_at = history.len();
                 }
+                Err(_) => skipped += 1,
+            },
+            Some("block_removed") => match serde_json::from_value(record.clone()) {
+                Ok(removed) => replace_block(&mut history, &removed),
                 Err(_) => skipped += 1,
             },
             Some("clear") => match record["before"].as_u64() {

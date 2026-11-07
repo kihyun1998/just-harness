@@ -149,6 +149,8 @@ class Handler(BaseHTTPRequestHandler):
             record = {"path": self.path, "size": size, "over": bool(too_long)}
             log.write(json.dumps({**record, "body": body}) + "\n")
 
+        if self.args.refuse_block and ('"type": "image"' in json.dumps(messages) or '"type": "document"' in json.dumps(messages)):
+            return self.refuse(self.args.refuse_block)
         if too_long:
             detail = (
                 f": {size} tokens > {self.args.limit} maximum"
@@ -202,6 +204,11 @@ def main():
         "--report-tokens",
         action="store_true",
         help="name the sizes in a too-long refusal",
+    )
+    parser.add_argument(
+        "--refuse-block",
+        metavar="MESSAGE",
+        help="answer a request holding an image or document block with this 400",
     )
     parser.add_argument(
         "--refuse-summary-with-results",

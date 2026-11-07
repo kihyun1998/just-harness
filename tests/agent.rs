@@ -2,8 +2,11 @@ mod support;
 
 use std::sync::Mutex;
 
-use just_harness::agent::{Agent, AllowAll, Approval, ApprovalRequest, Approver, TurnEnd};
-use just_harness::api::{self, Client, StopReason};
+use just_harness::agent::{
+    Agent, AllowAll, Approval, ApprovalRequest, Approver, Observer, TurnEnd,
+};
+use just_harness::api::{self, Client, ContentBlock, MessageParam, Role, StopReason};
+use just_harness::clearing::RemovedBlock;
 use just_harness::tools::{Tool, ToolContext, ToolFuture, ToolOutput, ToolSet};
 use serde_json::{Value, json};
 use support::{FakeTransport, config, sent_body, text_reply, tool_reply, user};
@@ -880,4 +883,302 @@ async fn recorded_tool_definitions_are_sent_in_place_of_the_tool_sets() {
         );
     }
     assert_eq!(echo.calls.lock().unwrap().len(), 1);
+}
+
+const DATA: &str = "ZGF0YQ==";
+
+fn document() -> ContentBlock {
+    ContentBlock(json!({
+        "type": "document",
+        "source": { "type": "base64", "media_type": "application/pdf", "data": DATA },
+    }))
+}
+
+fn image(data: &str) -> ContentBlock {
+    ContentBlock(json!({
+        "type": "image",
+        "source": { "type": "base64", "media_type": "image/png", "data": data },
+    }))
+}
+
+fn tool_call(id: &str) -> MessageParam {
+    MessageParam {
+        role: Role::Assistant,
+        content: vec![ContentBlock(
+            json!({ "type": "tool_use", "id": id, "name": "read_file", "input": { "path": "a" } }),
+        )],
+    }
+}
+
+fn result_of(id: &str, blocks: Vec<ContentBlock>) -> MessageParam {
+    MessageParam {
+        role: Role::User,
+        content: vec![ContentBlock::tool_result_blocks(id, blocks, false)],
+    }
+}
+
+fn refusal(message: &str) -> String {
+    json!({ "type": "error", "error": { "type": "invalid_request_error", "message": message } })
+        .to_string()
+}
+
+fn agent_on(transport: &FakeTransport) -> Agent<&FakeTransport> {
+    let dir = std::env::temp_dir();
+    Agent::new(
+        Client::with_transport(config(), transport),
+        "claude-haiku-5-5",
+        ToolSet::new(),
+        ToolContext::new(dir).unwrap(),
+    )
+}
+
+#[derive(Default)]
+struct Removed(Vec<RemovedBlock>);
+
+impl Observer for Removed {
+    fn on_block_removed(&mut self, removed: &RemovedBlock) {
+        self.0.push(removed.clone());
+    }
+}
+
+#[tokio::test]
+async fn a_refused_document_is_replaced_with_what_happened_and_the_request_sent_again() {
+    let transport = FakeTransport::new()
+        .respond(
+            400,
+            vec![&refusal(
+                "messages.2.content.0.tool_result.content.1.document.source.base64.data: The PDF specified was not valid.",
+            )],
+        )
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = agent_on(&transport);
+    let mut history = vec![
+        user("read it"),
+        tool_call("t1"),
+        result_of(
+            "t1",
+            vec![ContentBlock::text("PDF file read: a.pdf"), document()],
+        ),
+    ];
+    let mut removed = Removed::default();
+
+    let outcome = agent
+        .run_turn(&mut history, &mut removed, &mut AllowAll)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.end, TurnEnd::Stopped(Some(StopReason::EndTurn)));
+    assert_eq!(transport.requests().len(), 2);
+    let sent = sent_body(&transport, 1);
+    assert_eq!(
+        sent["messages"][2]["content"][0]["content"],
+        json!([
+            { "type": "text", "text": "PDF file read: a.pdf" },
+            { "type": "text", "text": "[Document removed: the API could not process this document (The PDF specified was not valid.). The file may be unsupported or corrupt; do not retry reading it. If you need to inspect it, use a shell command instead.]" },
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(&history[2]).unwrap(),
+        sent["messages"][2],
+        "the history holds what was sent"
+    );
+    assert_eq!(removed.0.len(), 1);
+    assert_eq!(
+        (
+            removed.0[0].message,
+            removed.0[0].block,
+            removed.0[0].nested
+        ),
+        (2, 0, Some(1))
+    );
+}
+
+#[tokio::test]
+async fn a_refused_image_goes_newest_first_and_again_while_it_is_refused() {
+    let transport = FakeTransport::new()
+        .respond(400, vec![&refusal("Could not process image")])
+        .respond(400, vec![&refusal("Could not process image")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = agent_on(&transport);
+    let mut history = vec![
+        user("look"),
+        tool_call("t1"),
+        result_of("t1", vec![image("b2xkZXN0")]),
+        tool_call("t2"),
+        result_of("t2", vec![image("bWlkZGxl")]),
+        tool_call("t3"),
+        result_of("t3", vec![image("bmV3ZXN0")]),
+    ];
+
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    assert_eq!(transport.requests().len(), 3);
+    let first_retry = sent_body(&transport, 1);
+    assert_eq!(
+        first_retry["messages"][4]["content"][0]["content"][0]["type"],
+        "image"
+    );
+    assert_eq!(
+        first_retry["messages"][6]["content"][0]["content"][0]["type"],
+        "text"
+    );
+    let second_retry = sent_body(&transport, 2);
+    assert_eq!(
+        second_retry["messages"][2]["content"][0]["content"][0]["type"],
+        "image"
+    );
+    assert_eq!(
+        second_retry["messages"][4]["content"][0]["content"][0]["type"],
+        "text"
+    );
+    assert_eq!(
+        second_retry["messages"][6]["content"][0]["content"][0]["type"],
+        "text"
+    );
+    assert!(
+        first_retry["messages"][6]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(
+                "[Image removed: the API could not process this image (Could not process image). "
+            )
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_removes_only_its_own_kind_of_block() {
+    let transport = FakeTransport::new()
+        .respond(400, vec![&refusal("PDF is password protected.")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = agent_on(&transport);
+    let mut history = vec![
+        user("look"),
+        tool_call("t1"),
+        result_of("t1", vec![document()]),
+        tool_call("t2"),
+        result_of("t2", vec![image(DATA)]),
+    ];
+
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let sent = sent_body(&transport, 1);
+    assert_eq!(
+        sent["messages"][2]["content"][0]["content"][0]["type"],
+        "text"
+    );
+    assert_eq!(
+        sent["messages"][4]["content"][0]["content"][0]["type"],
+        "image"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_block_outside_a_result_is_replaced_too() {
+    let transport = FakeTransport::new()
+        .respond(400, vec![&refusal("Could not process image")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = agent_on(&transport);
+    let carried = MessageParam {
+        role: Role::User,
+        content: vec![
+            ContentBlock::text("<recent-files>\n</recent-files>"),
+            image(DATA),
+        ],
+    };
+    let mut history = vec![carried, user("next")];
+    let mut removed = Removed::default();
+
+    agent
+        .run_turn(&mut history, &mut removed, &mut AllowAll)
+        .await
+        .unwrap();
+
+    let sent = sent_body(&transport, 1);
+    assert_eq!(sent["messages"][0]["content"][1]["type"], "text");
+    assert_eq!(
+        (
+            removed.0[0].message,
+            removed.0[0].block,
+            removed.0[0].nested
+        ),
+        (0, 1, None)
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_about_nothing_there_or_something_else_stays_an_error() {
+    for (message, status) in [
+        ("Could not process image", 400),
+        ("PDF is password protected.", 400),
+        ("messages.2.content.0: bad thing", 400),
+        ("document: unsupported", 400),
+        ("Could not process image", 403),
+    ] {
+        let transport = FakeTransport::new().respond(status, vec![&refusal(message)]);
+        let agent = agent_on(&transport);
+        let blocks = if message.contains("image") {
+            vec![ContentBlock::text("no image here")]
+        } else if message.contains("PDF") {
+            vec![image(DATA)]
+        } else {
+            vec![image(DATA), document()]
+        };
+        let blocks = if status == 403 {
+            vec![image(DATA)]
+        } else {
+            blocks
+        };
+        let mut history = vec![user("look"), tool_call("t1"), result_of("t1", blocks)];
+        let before = history.clone();
+
+        let result = agent.run_turn(&mut history, &mut (), &mut AllowAll).await;
+
+        assert!(result.is_err(), "{message}");
+        assert_eq!(transport.requests().len(), 1, "{message}");
+        assert_eq!(history, before, "{message}");
+    }
+}
+
+#[tokio::test]
+async fn removing_a_block_removes_the_thinking_after_it_and_keeps_the_thinking_before() {
+    let transport = FakeTransport::new()
+        .respond(400, vec![&refusal("Could not process image")])
+        .respond(200, vec![&text_reply("ok", "end_turn")]);
+    let agent = agent_on(&transport);
+    let thinking = |signature: &str| {
+        ContentBlock(json!({ "type": "thinking", "thinking": "", "signature": signature }))
+    };
+    let mut calling = tool_call("t1");
+    calling.content.insert(0, thinking("before"));
+    let mut history = vec![
+        user("look"),
+        calling,
+        result_of("t1", vec![image(DATA)]),
+        MessageParam {
+            role: Role::Assistant,
+            content: vec![thinking("after"), ContentBlock::text("seen")],
+        },
+        MessageParam {
+            role: Role::Assistant,
+            content: vec![thinking("alone")],
+        },
+        user("next"),
+    ];
+
+    agent
+        .run_turn(&mut history, &mut (), &mut AllowAll)
+        .await
+        .unwrap();
+
+    let sent = sent_body(&transport, 1);
+    assert_eq!(sent["messages"][1]["content"][0]["signature"], "before");
+    assert_eq!(sent["messages"][3]["content"].as_array().unwrap().len(), 1);
+    assert_eq!(sent["messages"][3]["content"][0]["text"], "seen");
+    assert_eq!(sent["messages"][4]["content"][0]["type"], "text");
 }

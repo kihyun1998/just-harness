@@ -587,3 +587,19 @@ fn a_prompt_too_long_is_told_from_other_refusals() {
         .is_prompt_too_long()
     );
 }
+
+#[test]
+fn a_refusal_for_size_is_not_a_refused_block_whatever_it_mentions() {
+    let error = |message: &str| ApiError::Status {
+        status: 400,
+        body: json!({ "error": { "message": message } }),
+    };
+    assert_eq!(
+        error("prompt is too long: 200000 tokens of images").refused_block(),
+        None
+    );
+    assert_eq!(
+        error("Could not process image").refused_block(),
+        Some(("image", "Could not process image".to_string()))
+    );
+}

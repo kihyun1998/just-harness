@@ -15,7 +15,7 @@ use just_harness::api::{
     ApiError, Client, ClientConfig, ContentBlock, Message, MessageParam, Role, StopReason,
     Transport, Usage,
 };
-use just_harness::clearing::{ClearPolicy, clear_before, plan};
+use just_harness::clearing::{ClearPolicy, RemovedBlock, clear_before, plan};
 use just_harness::compaction::{
     CompactGate, CompactGuard, CompactPolicy, SHRINK_ATTEMPTS, TouchedFiles, compacted,
     last_resort_summary_request, put_back, shrunk_summary_request, summary, summary_request,
@@ -50,6 +50,11 @@ impl Observer for Terminal<'_> {
 
     fn on_usage(&mut self, usage: &Usage) {
         self.usages.push((usage.clone(), Instant::now()));
+    }
+
+    fn on_block_removed(&mut self, removed: &RemovedBlock) {
+        self.log.record_block_removed(removed);
+        println!("\n{}", one_line(&removed.text, 160));
     }
 
     fn on_event(&mut self, event: &Value) {
@@ -445,6 +450,10 @@ impl Log {
 
     fn record_clear(&mut self, before: usize) {
         self.write(|file| file.record_clear(before));
+    }
+
+    fn record_block_removed(&mut self, removed: &RemovedBlock) {
+        self.write(|file| file.record_block_removed(removed));
     }
 
     fn write(&mut self, op: impl FnOnce(&mut SessionLog) -> std::io::Result<()>) {

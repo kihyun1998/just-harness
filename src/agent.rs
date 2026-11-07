@@ -7,6 +7,7 @@ use crate::api::{
     ApiError, BlockKind, Client, ContentBlock, CreateMessageRequest, Message, MessageParam, Role,
     StopReason, Transport, Usage,
 };
+use crate::clearing::{RemovedBlock, remove_newest_block, removed_text};
 use crate::tools::{ToolContext, ToolOutput, ToolSet};
 
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
@@ -21,6 +22,8 @@ pub trait Observer {
     fn on_message(&mut self, _message: &MessageParam) {}
     /// The usage of a request that just ended.
     fn on_usage(&mut self, _usage: &Usage) {}
+    /// A block the API could not process was taken out of the history.
+    fn on_block_removed(&mut self, _removed: &RemovedBlock) {}
 }
 
 impl Observer for () {}
@@ -134,7 +137,7 @@ impl<T: Transport> Agent<T> {
         let mut usage = Usage::default();
         let mut user_stopped = false;
         loop {
-            let message = self.send(history.clone(), observer).await?;
+            let message = self.send_removing_refused(history, observer).await?;
             iterations += 1;
             usage.add(&message.usage);
             append(history, observer, message.to_param());
@@ -175,6 +178,28 @@ impl<T: Transport> Agent<T> {
                     usage.clone(),
                     message,
                 ));
+            }
+        }
+    }
+
+    /// Sends `history`. While the API refuses a block it holds, takes the
+    /// newest block of that kind out and sends it again.
+    async fn send_removing_refused(
+        &self,
+        history: &mut [MessageParam],
+        observer: &mut impl Observer,
+    ) -> Result<Message, ApiError> {
+        loop {
+            let error = match self.send(history.to_vec(), observer).await {
+                Ok(message) => return Ok(message),
+                Err(error) => error,
+            };
+            let removed = error.refused_block().and_then(|(kind, reason)| {
+                remove_newest_block(history, kind, &removed_text(kind, &reason))
+            });
+            match removed {
+                Some(removed) => observer.on_block_removed(&removed),
+                None => return Err(error),
             }
         }
     }

@@ -11,7 +11,7 @@ Claude Code's behaviour is the target (`docs/agents/thegraph.md`), and its docs 
 
 ## The fake API
 
-`examples/fake_api.py` logs every request and answers by the last user line. Its docstring lists the words it reacts to. The flags are `--port`, `--log`, `--limit` (refuse past that many bytes of messages, as "prompt is too long"), `--report-tokens` and `--refuse-summary-with-results`.
+`examples/fake_api.py` logs every request and answers by the last user line. Its docstring lists the words it reacts to. The flags are `--port`, `--log`, `--limit` (refuse past that many bytes of messages, as "prompt is too long"), `--report-tokens`, `--refuse-block <message>` (a 400 for any request holding an image or document block) and `--refuse-summary-with-results`.
 
 ```sh
 python3 examples/fake_api.py --port 18765 --log /tmp/x/requests.jsonl --limit 30000 &

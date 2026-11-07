@@ -1,9 +1,10 @@
 //! Clearing old tool results from the history, and the thinking blocks that
 //! clearing invalidates.
 
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
-use crate::api::{ContentBlock, MessageParam};
+use crate::api::{ContentBlock, MessageParam, Role};
 
 /// What a cleared tool result's content becomes.
 pub const CLEARED: &str =
@@ -99,17 +100,114 @@ pub fn clear_before(history: &mut [MessageParam], before: usize) -> Cleared {
     let Some(first) = first_changed else {
         return cleared;
     };
+    cleared.thinking = remove_thinking_from(history, first);
+    cleared
+}
+
+/// Removes every thinking block from `history[first..]`, and returns how many
+/// there were. A message left empty gets a text block.
+fn remove_thinking_from(history: &mut [MessageParam], first: usize) -> usize {
+    let mut removed = 0;
     for message in history.iter_mut().skip(first) {
         let had = message.content.len();
         message
             .content
             .retain(|b| !matches!(b.block_type(), "thinking" | "redacted_thinking"));
-        cleared.thinking += had - message.content.len();
+        removed += had - message.content.len();
         if message.content.is_empty() {
             message.content.push(ContentBlock::text(REASONING_CLEARED));
         }
     }
-    cleared
+    removed
+}
+
+/// An `image` or `document` block taken out of the history, and the text put
+/// in its place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedBlock {
+    /// The message that held it.
+    pub message: usize,
+    /// Its place in that message's content.
+    pub block: usize,
+    /// Its place in a tool result's content, when one held it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested: Option<usize>,
+    pub text: String,
+}
+
+/// What stands in for a block of `kind` the API could not process, for `reason`.
+pub fn removed_text(kind: &str, reason: &str) -> String {
+    let (title, noun) = if kind == "image" {
+        ("Image", "image")
+    } else {
+        ("Document", "document")
+    };
+    format!(
+        "[{title} removed: the API could not process this {noun} ({reason}). The file may be \
+         unsupported or corrupt; do not retry reading it. If you need to inspect it, use a shell \
+         command instead.]"
+    )
+}
+
+/// Puts `text` in the place of the newest block of `kind` in a user message,
+/// as [`replace_block`] does. `None` when there is none.
+pub fn remove_newest_block(
+    history: &mut [MessageParam],
+    kind: &str,
+    text: &str,
+) -> Option<RemovedBlock> {
+    let found = history
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| message.role == Role::User)
+        .find_map(|(m, message)| {
+            message
+                .content
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(b, block)| {
+                    if block.block_type() == kind {
+                        return Some((m, b, None));
+                    }
+                    let nested = block.0.get("content")?.as_array()?;
+                    let n = nested.iter().rposition(|inner| inner["type"] == kind)?;
+                    Some((m, b, Some(n)))
+                })
+        })?;
+    let removed = RemovedBlock {
+        message: found.0,
+        block: found.1,
+        nested: found.2,
+        text: text.to_string(),
+    };
+    replace_block(history, &removed);
+    Some(removed)
+}
+
+/// Applies `removed` to `history`, and removes every thinking block after the
+/// message it changes. A place that is not there changes nothing.
+pub fn replace_block(history: &mut [MessageParam], removed: &RemovedBlock) {
+    let Some(block) = history
+        .get_mut(removed.message)
+        .and_then(|message| message.content.get_mut(removed.block))
+    else {
+        return;
+    };
+    let text = json!({ "type": "text", "text": removed.text });
+    let place = match removed.nested {
+        Some(nested) => block
+            .0
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .and_then(|inner| inner.get_mut(nested)),
+        None => Some(&mut block.0),
+    };
+    if let Some(place) = place {
+        *place = text;
+        remove_thinking_from(history, removed.message + 1);
+    }
 }
 
 /// Whether the last message carries tool results, which the model has not

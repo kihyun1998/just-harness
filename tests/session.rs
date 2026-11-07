@@ -856,3 +856,65 @@ fn a_result_carrying_an_image_reads_back_as_it_was_written_and_clears() {
     assert_eq!(loaded.history[2].content[0].0["content"], json!(CLEARED));
     assert_eq!(loaded.history[2].content[1], messages[2].content[1]);
 }
+
+#[test]
+fn a_removed_block_stays_removed_on_load_with_the_thinking_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = ContentBlock(json!({
+        "type": "image",
+        "source": { "type": "base64", "media_type": "image/png", "data": "ZGF0YQ==" },
+    }));
+    let mut messages = vec![
+        text(Role::User, "look"),
+        tool_call("toolu_1"),
+        MessageParam {
+            role: Role::User,
+            content: vec![ContentBlock::tool_result_blocks(
+                "toolu_1",
+                vec![image],
+                false,
+            )],
+        },
+        tool_call("toolu_2"),
+    ];
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    for message in &messages {
+        log.append(message).unwrap();
+    }
+    let removed =
+        just_harness::clearing::remove_newest_block(&mut messages, "image", "gone").unwrap();
+    log.record_block_removed(&removed).unwrap();
+    log.append(&tool_result("toolu_2")).unwrap();
+    messages.push(tool_result("toolu_2"));
+
+    let loaded = load(log.path()).unwrap();
+
+    assert_eq!(loaded.history, messages);
+    assert_eq!(loaded.skipped, 0);
+    assert_eq!(
+        loaded.history[2].content[0].0["content"][0],
+        json!({ "type": "text", "text": "gone" })
+    );
+    assert_eq!(
+        loaded.history[3].content[0].block_type(),
+        "tool_use",
+        "thinking after it went"
+    );
+    assert_eq!(
+        loaded.history[1].content[0].block_type(),
+        "thinking",
+        "thinking before it stayed"
+    );
+}
+
+#[test]
+fn a_file_of_the_format_before_removed_blocks_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut old = meta("s");
+    old.version = 6;
+    let mut log = SessionLog::create(dir.path(), &old).unwrap();
+    log.append(&text(Role::User, "hello")).unwrap();
+
+    assert_eq!(load(log.path()).unwrap().history.len(), 1);
+    assert_eq!(FORMAT_VERSION, 7);
+}
