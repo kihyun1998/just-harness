@@ -911,3 +911,22 @@ fn recent_files_carrying_an_image_are_left_out_of_a_shrunk_summary_request() {
     assert_eq!(request[0], line);
     assert_eq!(request.len(), 2, "the line and the summary request");
 }
+
+#[test]
+fn a_pdf_does_not_come_back_or_take_a_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    write_aged(&root, "a.pdf", "%PDF-1.4\n", 1);
+    write_aged(&root, "big.pdf", "x".repeat(20_001), 2);
+    let touched = touched_by(
+        &[
+            ("read_file", "a.pdf", false),
+            ("read_file", "big.pdf", false),
+        ],
+        &root,
+    );
+
+    let back = put_back(&touched, &ToolContext::new(&root).unwrap(), &[]);
+
+    assert_eq!(back, PutBack::default());
+}

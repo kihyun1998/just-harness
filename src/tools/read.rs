@@ -3,11 +3,12 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::{Tool, ToolContext, ToolFuture, ToolOutput, str_arg, u64_arg};
+use super::{Tool, ToolContext, ToolFuture, ToolOutput, opt_str_arg, str_arg, u64_arg};
 use crate::api;
 
 mod image;
 mod notebook;
+mod pdf;
 
 pub use notebook::render as render_notebook;
 
@@ -36,6 +37,7 @@ pub enum FileKind {
     Text,
     Image,
     Notebook,
+    Pdf,
     Binary,
 }
 
@@ -53,6 +55,7 @@ pub fn file_kind(path: &Path) -> FileKind {
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" => FileKind::Image,
         "ipynb" => FileKind::Notebook,
+        "pdf" => FileKind::Pdf,
         other if BINARY_EXTENSIONS.contains(&other) => FileKind::Binary,
         _ => FileKind::Text,
     }
@@ -76,8 +79,8 @@ fn starts_as_image(path: &Path) -> bool {
     image::sniff(&start[..filled]).is_some()
 }
 
-/// Reads text files as numbered lines, images as image blocks, and notebooks
-/// as their cells.
+/// Reads text files as numbered lines, images as image blocks, notebooks as
+/// their cells, and PDFs as documents or page images.
 pub struct ReadFile;
 
 impl Tool for ReadFile {
@@ -90,14 +93,16 @@ impl Tool for ReadFile {
                  `limit` says otherwise, and at most {MAX_READ_BYTES} bytes; use `offset` to \
                  continue. Lines over {MAX_LINE_CHARS} characters are cut. PNG, JPEG, GIF and \
                  WebP images come back as images you can see, large ones scaled down. \
-                 Jupyter notebooks come back as their cells with their outputs."
+                 Jupyter notebooks come back as their cells with their outputs. PDFs of up to \
+                 10 pages come back whole; for longer ones give `pages`, up to 20 at a time."
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path relative to the working folder" },
                     "offset": { "type": "integer", "minimum": 1, "description": "First line to read, from 1" },
-                    "limit": { "type": "integer", "minimum": 1, "description": "Most lines to read" }
+                    "limit": { "type": "integer", "minimum": 1, "description": "Most lines to read" },
+                    "pages": { "type": "string", "description": "For a PDF, one page or one range to read, such as \"3\" or \"1-5\"" }
                 },
                 "required": ["path"]
             }),
@@ -106,7 +111,7 @@ impl Tool for ReadFile {
     }
 
     fn call<'a>(&'a self, input: &'a Value, ctx: &'a ToolContext) -> ToolFuture<'a> {
-        Box::pin(async move { read(input, ctx).unwrap_or_else(ToolOutput::error) })
+        Box::pin(async move { read(input, ctx).await.unwrap_or_else(ToolOutput::error) })
     }
 
     fn needs_approval(&self) -> bool {
@@ -114,7 +119,7 @@ impl Tool for ReadFile {
     }
 }
 
-fn read(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
+async fn read(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
     let path = ctx.resolve_file(str_arg(input, "path")?)?;
     let offset = u64_arg(input, "offset")?.unwrap_or(1).max(1) as usize;
     let limit = u64_arg(input, "limit")?
@@ -125,6 +130,7 @@ fn read(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
         FileKind::Text => {}
         FileKind::Image => return read_image(&path, &shown),
         FileKind::Notebook => return read_notebook(&path, &shown),
+        FileKind::Pdf => return pdf::read(&path, &shown, opt_str_arg(input, "pages")?).await,
         FileKind::Binary => return Err(binary_refusal(&path)),
     }
     let bytes = std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))?;

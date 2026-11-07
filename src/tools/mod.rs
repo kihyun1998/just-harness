@@ -256,6 +256,17 @@ fn str_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("missing string argument `{key}`"))
 }
 
+/// The optional string argument `key`.
+fn opt_str_arg<'a>(input: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("argument `{key}` must be a string")),
+    }
+}
+
 /// The optional non-negative integer argument `key`.
 fn u64_arg(input: &Value, key: &str) -> Result<Option<u64>, String> {
     match input.get(key) {

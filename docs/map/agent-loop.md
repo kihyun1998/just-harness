@@ -75,6 +75,16 @@ An image file's format comes from its bytes, not its extension, so a PNG named `
 - **Images:** take the same path as an image file, without the resize note, which Claude Code's small image never showed. The format comes from the bytes, where Claude Code sent a PNG under `image/jpeg` as the notebook labelled it. An output that does not decode becomes a line of text saying so; Claude Code's handling was not measured. Line ends inside the base64 are allowed.
 - A notebook's other errors follow Claude Code's wording: not JSON, and no `cells` array or a cell with no string or string-array `source`.
 
+### PDFs
+
+Measured on Claude Code 2.1.319 against a local fake API (2026-11-07) and followed, wording included, except where noted:
+
+- **Whole:** up to 10 pages, a text line and a `document` block. Over that, an error asking for `pages`. A page range is one page or one range of at most 20; anything else is an error, and a range running past the end is cut at the last page. A range starting past the end is an error. `pages` on anything but a PDF is ignored.
+- **Pages:** each page goes as a JPEG image, rendered by `pdftoppm` at 100 DPI: a 200-point page came back as 278 px. Through the same size rules as an image file. Started with `kill_on_drop` from `tokio::process`, so a Ctrl-C ends a slow render.
+- **Without poppler (measured with Homebrew off the `PATH`):** the page count is unknown, so a 12-page PDF is sent whole, and a range is the `pdftoppm is not installed` error. So 11 pages or more may reach the API here; its limit is 100 pages when the context window is under 1M tokens (pdf-support page), and what comes of going over it was not measured. `pdfinfo` as the source of the count is this project's choice, since removing Homebrew removes both of poppler's tools; which one Claude Code uses was not read.
+- **`MAX_WHOLE_BYTES` (90,000,000) is not Claude Code's:** the API limits a request to 128 MB, and base64 adds a third, so a whole PDF over this could not be sent. Claude Code's handling of one was not measured.
+- A 10-page PDF is not small: the pdf-support page gives 1,500-3,000 tokens of text per page plus each page as an image, up to 4,784 visual tokens at this tier, so as much as about 78,000 tokens by those figures, close to the triggers. Clearing and compaction run only between turns ([tool-result-clearing](tool-result-clearing.md)). Not measured; this needs a live key. A document's base64 counts by its bytes for clearing.
+
 A `ToolOutput` with `blocks` sends them as the result's `content`, and `content` becomes only what the terminal shows, so base64 cannot reach the screen (checked against the fake API on 2026-11-07). A text block goes after all of a reply's results because the API requires text after `tool_result` blocks in a user message (handle-tool-calls page). Results with no blocks stay strings, byte for byte.
 
 Not checked: whether the API accepts these blocks from this harness. The key in `.env` still got a 401 on 2026-11-07 (`GET /v1/models`), so the shape rests on the docs and on it being what Claude Code sends. EXIF orientation is not applied, so a rotated photo that gets re-encoded loses its rotation; Claude Code's handling was not measured. Decoding runs on the async task without yielding, so by the code a Ctrl-C has to wait for it to end; not measured.

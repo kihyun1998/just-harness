@@ -1290,3 +1290,247 @@ async fn read_file_refuses_a_notebook_over_its_size_limits() {
     assert!(err, "{out}");
     assert!(out.contains("too large"), "{out}");
 }
+
+/// A PDF of `pages` empty pages of 200x200 points.
+fn pdf(pages: usize) -> Vec<u8> {
+    let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 3 + i)).collect();
+    let mut objects = vec![
+        "<</Type/Catalog/Pages 2 0 R>>".to_string(),
+        format!("<</Type/Pages/Kids[{}]/Count {pages}>>", kids.join(" ")),
+    ];
+    for _ in 0..pages {
+        objects.push("<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>".to_string());
+    }
+    let mut out = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out += &format!("{} 0 obj{object}endobj\n", i + 1);
+    }
+    let table = out.len();
+    out += &format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+    for offset in offsets {
+        out += &format!("{offset:010} 00000 n \n");
+    }
+    out += &format!(
+        "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{table}\n%%EOF\n",
+        objects.len() + 1
+    );
+    out.into_bytes()
+}
+
+/// Whether poppler's tools are here; tests of what they do say so when not.
+fn poppler() -> bool {
+    let found = ["pdfinfo", "pdftoppm"]
+        .iter()
+        .all(|tool| std::process::Command::new(tool).arg("-v").output().is_ok());
+    if !found {
+        eprintln!("skipped: pdfinfo and pdftoppm are not installed");
+    }
+    found
+}
+
+fn kinds(content: &Value) -> Vec<&str> {
+    content
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn read_file_returns_a_short_pdf_whole_as_a_document() {
+    if !poppler() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = pdf(10);
+    std::fs::write(dir.path().join("ten.PDF"), &bytes).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "ten.PDF" })).await;
+
+    let content = &message[0]["content"];
+    assert_eq!(kinds(content), ["text", "document"]);
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("PDF file read: ten.PDF ("), "{text}");
+    assert_eq!(
+        content[1],
+        json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": BASE64.encode(&bytes),
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn read_file_asks_for_pages_of_a_longer_pdf() {
+    if !poppler() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("eleven.pdf"), pdf(11)).unwrap();
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "eleven.pdf" })).await;
+
+    assert!(err, "{out}");
+    assert_eq!(
+        out,
+        "This PDF has 11 pages, which is too many to read at once. Use the pages parameter to read specific page ranges (e.g., pages: \"1-5\"). Maximum 20 pages per request."
+    );
+}
+
+#[tokio::test]
+async fn read_file_renders_the_pages_asked_for_as_jpegs_at_100_dpi() {
+    if !poppler() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("long.pdf"), pdf(12)).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "long.pdf", "pages": "2-3" })).await;
+
+    let content = &message[0]["content"];
+    assert_eq!(kinds(content), ["text", "image", "image"]);
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("PDF pages extracted: 2 page(s) from long.pdf ("),
+        "{text}"
+    );
+    let source = &content[1]["source"];
+    assert_eq!(source["media_type"], "image/jpeg");
+    let page = image::load_from_memory(&decoded(source)).unwrap();
+    assert_eq!((page.width(), page.height()), (278, 278));
+
+    let message = read_message(dir.path(), json!({ "path": "long.pdf", "pages": "12" })).await;
+    assert_eq!(kinds(&message[0]["content"]), ["text", "image"]);
+}
+
+#[tokio::test]
+async fn read_file_cuts_a_page_range_at_the_last_page() {
+    if !poppler() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("three.pdf"), pdf(3)).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "three.pdf", "pages": "2-5" })).await;
+    assert_eq!(kinds(&message[0]["content"]), ["text", "image", "image"]);
+
+    let (out, err) = call(
+        dir.path(),
+        "read_file",
+        json!({ "path": "three.pdf", "pages": "5-6" }),
+    )
+    .await;
+    assert!(err, "{out}");
+    assert_eq!(
+        out,
+        "Requested pages 5-6 is outside the document (PDF has 3 pages). Use a range within 1-3, maximum 20 pages per request (e.g. pages: \"1-3\")."
+    );
+}
+
+#[tokio::test]
+async fn read_file_allows_twenty_pages_and_refuses_more() {
+    if !poppler() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("long.pdf"), pdf(21)).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "long.pdf", "pages": "1-20" })).await;
+    assert_eq!(message[0]["content"].as_array().unwrap().len(), 21);
+
+    let (out, err) = call(
+        dir.path(),
+        "read_file",
+        json!({ "path": "long.pdf", "pages": "1-21" }),
+    )
+    .await;
+    assert!(err, "{out}");
+    assert_eq!(
+        out,
+        "Page range \"1-21\" exceeds maximum of 20 pages per request. Please use a smaller range."
+    );
+}
+
+#[tokio::test]
+async fn read_file_refuses_pages_it_cannot_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("three.pdf"), pdf(3)).unwrap();
+
+    for pages in ["abc", "3-1", "0", "1,2", "1-", "-2", ""] {
+        let (out, err) = call(
+            dir.path(),
+            "read_file",
+            json!({ "path": "three.pdf", "pages": pages }),
+        )
+        .await;
+        assert!(err, "{pages}: {out}");
+        assert_eq!(
+            out,
+            format!(
+                "Invalid pages parameter: \"{pages}\". Give one page (\"3\") or one range (\"1-5\"), not a list. To read several pages or ranges, read each one separately. Pages are 1-indexed."
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_file_refuses_what_is_not_the_pdf_its_name_says() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "fake.pdf", "not a pdf\n");
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "fake.pdf" })).await;
+
+    assert!(err, "{out}");
+    assert_eq!(
+        out,
+        "File is not a valid PDF (missing %PDF- header): fake.pdf"
+    );
+}
+
+#[tokio::test]
+async fn read_file_refuses_a_pdf_too_large_to_send_whole_without_reading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut file = std::fs::File::create(dir.path().join("huge.pdf")).unwrap();
+    std::io::Write::write_all(&mut file, b"%PDF-1.4\n").unwrap();
+    file.set_len(90_000_001).unwrap();
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "huge.pdf" })).await;
+
+    assert!(err, "{out}");
+    assert!(out.contains("too large to send whole"), "{out}");
+}
+
+#[tokio::test]
+async fn read_file_ignores_pages_on_a_text_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "a.txt", "hello\n");
+
+    let (out, err) = call(
+        dir.path(),
+        "read_file",
+        json!({ "path": "a.txt", "pages": "abc" }),
+    )
+    .await;
+
+    assert_eq!((out.as_str(), err), ("     1\thello", false));
+}
+
+#[tokio::test]
+async fn read_file_gives_a_pdfs_size_in_kilobytes_without_a_bare_decimal() {
+    let dir = tempfile::tempdir().unwrap();
+    for (bytes, shown) in [(1024, "(1KB)"), (3584, "(3.5KB)")] {
+        let mut data = b"%PDF-1.4\n".to_vec();
+        data.resize(bytes, b' ');
+        std::fs::write(dir.path().join("sized.pdf"), data).unwrap();
+        let message = read_message(dir.path(), json!({ "path": "sized.pdf" })).await;
+        let text = message[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with(shown), "{text}");
+    }
+}
