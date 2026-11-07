@@ -7,6 +7,9 @@ use super::{Tool, ToolContext, ToolFuture, ToolOutput, str_arg, u64_arg};
 use crate::api;
 
 mod image;
+mod notebook;
+
+pub use notebook::render as render_notebook;
 
 pub const DEFAULT_READ_LIMIT: usize = 2000;
 /// The most bytes one read returns; lines past it are left for the next offset.
@@ -15,6 +18,8 @@ pub const MAX_READ_BYTES: usize = 50_000;
 pub const MAX_LINE_CHARS: usize = 2000;
 /// The largest image file read.
 pub const MAX_IMAGE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+/// The largest notebook file read.
+pub const MAX_NOTEBOOK_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Extensions refused as binary formats.
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -30,6 +35,7 @@ const BINARY_EXTENSIONS: &[&str] = &[
 pub enum FileKind {
     Text,
     Image,
+    Notebook,
     Binary,
 }
 
@@ -46,6 +52,7 @@ pub fn file_kind(path: &Path) -> FileKind {
     let extension = extension.to_ascii_lowercase();
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" => FileKind::Image,
+        "ipynb" => FileKind::Notebook,
         other if BINARY_EXTENSIONS.contains(&other) => FileKind::Binary,
         _ => FileKind::Text,
     }
@@ -69,7 +76,8 @@ fn starts_as_image(path: &Path) -> bool {
     image::sniff(&start[..filled]).is_some()
 }
 
-/// Reads text files as numbered lines, and images as image blocks.
+/// Reads text files as numbered lines, images as image blocks, and notebooks
+/// as their cells.
 pub struct ReadFile;
 
 impl Tool for ReadFile {
@@ -81,7 +89,8 @@ impl Tool for ReadFile {
                  as `<number>\\t<line>`. Reads up to {DEFAULT_READ_LIMIT} lines unless \
                  `limit` says otherwise, and at most {MAX_READ_BYTES} bytes; use `offset` to \
                  continue. Lines over {MAX_LINE_CHARS} characters are cut. PNG, JPEG, GIF and \
-                 WebP images come back as images you can see, large ones scaled down."
+                 WebP images come back as images you can see, large ones scaled down. \
+                 Jupyter notebooks come back as their cells with their outputs."
             ),
             input_schema: json!({
                 "type": "object",
@@ -115,6 +124,7 @@ fn read(input: &Value, ctx: &ToolContext) -> Result<ToolOutput, String> {
     match file_kind(&path) {
         FileKind::Text => {}
         FileKind::Image => return read_image(&path, &shown),
+        FileKind::Notebook => return read_notebook(&path, &shown),
         FileKind::Binary => return Err(binary_refusal(&path)),
     }
     let bytes = std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))?;
@@ -190,6 +200,24 @@ fn read_image(path: &Path, shown: &str) -> Result<ToolOutput, String> {
         content: format!("[image {shown}, {}x{}]", prepared.width, prepared.height),
         blocks: vec![prepared.block],
         after: prepared.note,
+        is_error: false,
+    })
+}
+
+fn read_notebook(path: &Path, shown: &str) -> Result<ToolOutput, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+    if meta.len() > MAX_NOTEBOOK_FILE_BYTES {
+        return Err(format!(
+            "Notebook file is too large to read (the limit is 100MB): {shown}. Read a portion \
+             with a shell command instead, such as: cat <notebook_path> | jq '.cells[:20]'"
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
+    let blocks = notebook::render(&bytes)?;
+    Ok(ToolOutput {
+        content: format!("[notebook {shown}]"),
+        blocks,
+        after: None,
         is_error: false,
     })
 }

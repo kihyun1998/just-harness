@@ -823,3 +823,91 @@ fn an_image_does_not_come_back_or_take_a_place() {
         "{text}"
     );
 }
+
+const PICTURE: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+fn notebook_with_picture() -> String {
+    json!({
+        "cells": [{ "cell_type": "code", "id": "c1", "metadata": {}, "source": ["plot()"],
+                    "outputs": [{ "output_type": "display_data", "metadata": {},
+                                  "data": { "image/png": PICTURE, "text/plain": "<Figure>" } }] }],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    })
+    .to_string()
+}
+
+#[test]
+fn a_notebook_comes_back_as_its_cells_with_its_images_after_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    write_aged(&root, "n.ipynb", notebook_with_picture(), 1);
+    write_aged(&root, "a.txt", "alpha\n", 2);
+    let touched = touched_by(
+        &[
+            ("read_file", "n.ipynb", false),
+            ("read_file", "a.txt", false),
+        ],
+        &root,
+    );
+
+    let back = put_back(&touched, &ToolContext::new(&root).unwrap(), &[]);
+
+    assert_eq!(back.read, [root.join("n.ipynb"), root.join("a.txt")]);
+    let message = back.message.unwrap();
+    assert_eq!(message.content.len(), 2);
+    let text = message_text(&message);
+    assert!(text.starts_with("<recent-files>\n"), "{text}");
+    assert!(text.ends_with("</recent-files>"), "{text}");
+    assert!(
+        text.contains(
+            "Contents of n.ipynb:\n\n<cell id=\"c1\">plot()</cell id=\"c1\">\n\n<Figure>"
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("nbformat") && !text.contains(PICTURE),
+        "{text}"
+    );
+    assert_eq!(message.content[1].0["type"], "image");
+}
+
+#[test]
+fn a_notebook_over_the_size_comes_back_as_its_path_and_a_broken_one_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    write_aged(&root, "big.ipynb", "x".repeat(20_001), 1);
+    write_aged(&root, "broken.ipynb", "{not json", 2);
+    let touched = touched_by(
+        &[
+            ("read_file", "big.ipynb", false),
+            ("read_file", "broken.ipynb", false),
+        ],
+        &root,
+    );
+
+    let back = put_back(&touched, &ToolContext::new(&root).unwrap(), &[]);
+
+    assert_eq!(back.referenced, [root.join("big.ipynb")]);
+    assert!(back.read.is_empty(), "{:?}", back.read);
+}
+
+#[test]
+fn recent_files_carrying_an_image_are_left_out_of_a_shrunk_summary_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    write_aged(&root, "n.ipynb", notebook_with_picture(), 1);
+    let touched = touched_by(&[("read_file", "n.ipynb", false)], &root);
+    let carried = put_back(&touched, &ToolContext::new(&root).unwrap(), &[])
+        .message
+        .unwrap();
+    let line = MessageParam {
+        role: Role::User,
+        content: vec![ContentBlock::text("hello")],
+    };
+
+    let request = shrunk_summary_request(&[carried, line.clone()], 0).unwrap();
+
+    assert_eq!(request[0], line);
+    assert_eq!(request.len(), 2, "the line and the summary request");
+}

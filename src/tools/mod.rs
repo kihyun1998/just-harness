@@ -16,7 +16,7 @@ mod search;
 mod shell;
 
 pub use edit::EditFile;
-pub use read::{FileKind, ReadFile, file_kind};
+pub use read::{FileKind, ReadFile, file_kind, render_notebook};
 pub use search::Search;
 pub use shell::Shell;
 

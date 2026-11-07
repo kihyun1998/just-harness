@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::api::{BlockKind, ContentBlock, Message, MessageParam, Role, StopReason};
 use crate::clearing::{REASONING_CLEARED, clear_before};
-use crate::tools::{FileKind, ToolContext, file_kind};
+use crate::tools::{FileKind, ToolContext, file_kind, render_notebook};
 
 /// The user message appended to the history to ask for the summary.
 pub const SUMMARY_REQUEST: &str = "The conversation is about to be compacted: everything above \
@@ -198,7 +198,7 @@ pub fn last_resort_summary_request() -> Vec<MessageParam> {
 
 fn is_carried(message: &MessageParam) -> bool {
     message.role == Role::User
-        && matches!(message.content.as_slice(), [block] if matches!(
+        && matches!(message.content.as_slice(), [block, ..] if matches!(
             block.kind(),
             BlockKind::Text(text) if CARRIED.iter().any(|tag| {
                 text.strip_prefix(tag).is_some_and(|rest| rest.starts_with('\n'))
@@ -301,8 +301,9 @@ pub struct PutBack {
 /// most recently modified first, read from disk now. A file over
 /// [`PUT_BACK_MAX_TOKENS`] comes back as its path, whatever it holds. A file
 /// that is gone, is one of `carried`, is not a regular file, is an image, is
-/// not UTF-8 text at or under that size, or that `ctx` refuses is left out and
-/// takes no place.
+/// neither UTF-8 text nor a readable notebook at or under that size, or that
+/// `ctx` refuses is left out and takes no place. A notebook comes back as its
+/// cells, its images after the message's text.
 pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) -> PutBack {
     let carried: Vec<PathBuf> = carried
         .iter()
@@ -322,7 +323,7 @@ pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) 
         }
         if let Ok(meta) = std::fs::metadata(&resolved)
             && meta.is_file()
-            && file_kind(&resolved) == FileKind::Text
+            && matches!(file_kind(&resolved), FileKind::Text | FileKind::Notebook)
             && let Ok(modified) = meta.modified()
         {
             candidates.push((modified, meta.len(), resolved));
@@ -332,6 +333,7 @@ pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) 
 
     let mut back = PutBack::default();
     let mut parts = Vec::new();
+    let mut images = Vec::new();
     for (_, bytes, path) in candidates {
         if back.read.len() + back.referenced.len() == PUT_BACK_FILES {
             break;
@@ -343,20 +345,37 @@ pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) 
                  its contents are not here."
             ));
             back.referenced.push(path);
+        } else if file_kind(&path) == FileKind::Notebook {
+            if let Some(blocks) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| render_notebook(&bytes).ok())
+            {
+                let mut cells = Vec::new();
+                for block in blocks {
+                    match block.kind() {
+                        BlockKind::Text(text) => cells.push(text.to_string()),
+                        _ => images.push(block),
+                    }
+                }
+                parts.push(format!("Contents of {shown}:\n\n{}", cells.join("\n")));
+                back.read.push(path);
+            }
         } else if let Ok(contents) = std::fs::read_to_string(&path) {
             parts.push(format!("Contents of {shown}:\n\n{}", contents.trim_end()));
             back.read.push(path);
         }
     }
     if !parts.is_empty() {
+        let mut content = vec![ContentBlock::text(format!(
+            "<recent-files>\nFiles read or edited earlier in this session, as they are on \
+             disk now. They are context for the work, not the user's request.\n\n{}\n\
+             </recent-files>",
+            parts.join("\n\n")
+        ))];
+        content.extend(images);
         back.message = Some(MessageParam {
             role: Role::User,
-            content: vec![ContentBlock::text(format!(
-                "<recent-files>\nFiles read or edited earlier in this session, as they are on \
-                 disk now. They are context for the work, not the user's request.\n\n{}\n\
-                 </recent-files>",
-                parts.join("\n\n")
-            ))],
+            content,
         });
     }
     back

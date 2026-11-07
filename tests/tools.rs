@@ -1075,3 +1075,218 @@ async fn read_file_keeps_a_text_extension_as_text() {
     assert!(err, "{out}");
     assert!(out.contains("not UTF-8 text"), "{out}");
 }
+
+fn notebook(root: &Path, name: &str, notebook: &Value) {
+    std::fs::write(root.join(name), notebook.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn read_file_returns_a_notebooks_cells_with_their_outputs_and_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let picture = BASE64.encode(png(4, 4, false));
+    notebook(
+        dir.path(),
+        "n.ipynb",
+        &json!({
+            "cells": [
+                { "cell_type": "markdown", "id": "md1", "metadata": {}, "source": ["# Title\n", "text"] },
+                { "cell_type": "code", "id": "c1", "metadata": {}, "source": ["print(1)"],
+                  "outputs": [{ "output_type": "stream", "name": "stdout", "text": ["1\n"] }] },
+                { "cell_type": "code", "id": "c2", "metadata": {}, "source": ["plot()"],
+                  "outputs": [{ "output_type": "display_data", "metadata": {},
+                                "data": { "image/png": picture, "text/plain": ["<Figure>"] } }] },
+            ],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+        }),
+    );
+
+    let message = read_message(dir.path(), json!({ "path": "n.ipynb" })).await;
+
+    let content = &message[0]["content"];
+    assert_eq!(content.as_array().unwrap().len(), 2);
+    assert_eq!(
+        content[0],
+        json!({
+            "type": "text",
+            "text": "<cell id=\"md1\"><cell_type>markdown</cell_type># Title\ntext</cell id=\"md1\">\n<cell id=\"c1\">print(1)</cell id=\"c1\">\n\n1\n\n<cell id=\"c2\">plot()</cell id=\"c2\">\n\n<Figure>",
+        })
+    );
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+}
+
+#[tokio::test]
+async fn read_file_handles_a_notebooks_other_languages_ids_and_output_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    // The data is a PNG whatever key it is under.
+    let picture = BASE64.encode(png(4, 4, false));
+    notebook(
+        dir.path(),
+        "edge.ipynb",
+        &json!({
+            "cells": [
+                { "cell_type": "code", "metadata": {}, "source": "no_id()",
+                  "outputs": [{ "output_type": "execute_result", "metadata": {},
+                                "data": { "text/plain": ["42"] } }] },
+                { "cell_type": "raw", "metadata": {}, "source": ["raw text"] },
+                { "cell_type": "code", "id": "e1", "metadata": {}, "source": ["boom()"],
+                  "outputs": [{ "output_type": "error", "ename": "ValueError", "evalue": "bad",
+                                "traceback": ["tb line 1", "tb line 2"] }] },
+                { "cell_type": "code", "id": "t1", "metadata": {}, "source": ["long()"],
+                  "outputs": [{ "output_type": "stream", "name": "stdout", "text": "x".repeat(20_000) }] },
+                { "cell_type": "code", "id": "j1", "metadata": {}, "source": ["both()"],
+                  "outputs": [
+                      { "output_type": "display_data", "metadata": {},
+                        "data": { "image/jpeg": picture, "text/html": ["<b>h</b>"] } },
+                      { "output_type": "stream", "name": "stderr", "text": ["warn\n"] },
+                  ] },
+            ],
+            "metadata": { "language_info": { "name": "julia" } },
+            "nbformat": 4, "nbformat_minor": 4,
+        }),
+    );
+
+    let message = read_message(dir.path(), json!({ "path": "edge.ipynb" })).await;
+
+    let content = &message[0]["content"];
+    assert_eq!(content.as_array().unwrap().len(), 3);
+    assert_eq!(
+        content[0]["text"],
+        "<cell id=\"cell-0\"><language>julia</language>no_id()</cell id=\"cell-0\">\n\n42\n<cell id=\"cell-1\"><cell_type>raw</cell_type>raw text</cell id=\"cell-1\">\n<cell id=\"e1\"><language>julia</language>boom()</cell id=\"e1\">\n\nValueError: bad\ntb line 1\ntb line 2\n<cell id=\"t1\"><language>julia</language>long()</cell id=\"t1\">\n\nOutputs are too large to include. Use a shell command: cat <notebook_path> | jq '.cells[3].outputs'\n<cell id=\"j1\"><language>julia</language>both()</cell id=\"j1\">"
+    );
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[2]["text"], "\nwarn\n");
+}
+
+#[tokio::test]
+async fn read_file_keeps_a_notebooks_outputs_of_at_most_10000_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = |n: usize| {
+        json!({
+            "cells": [{ "cell_type": "code", "id": "c", "metadata": {}, "source": [],
+                        "outputs": [
+                            { "output_type": "stream", "name": "stdout", "text": "x".repeat(n / 2) },
+                            { "output_type": "stream", "name": "stderr", "text": "y".repeat(n - n / 2) },
+                        ] }],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+        })
+    };
+    notebook(dir.path(), "fits.ipynb", &cell(10_000));
+    notebook(dir.path(), "over.ipynb", &cell(10_001));
+
+    let fits = read_message(dir.path(), json!({ "path": "fits.ipynb" })).await;
+    let over = read_message(dir.path(), json!({ "path": "over.ipynb" })).await;
+
+    assert!(
+        !fits[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("too large")
+    );
+    assert!(
+        over[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("too large")
+    );
+}
+
+#[tokio::test]
+async fn read_file_keeps_the_text_of_an_output_whose_image_does_not_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    notebook(
+        dir.path(),
+        "bad.ipynb",
+        &json!({
+            "cells": [{ "cell_type": "code", "id": "c", "metadata": {}, "source": [],
+                        "outputs": [{ "output_type": "display_data", "metadata": {},
+                                      "data": { "image/png": "bm90IGEgcGljdHVyZQ==", "text/plain": "kept" } }] }],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+        }),
+    );
+
+    let message = read_message(dir.path(), json!({ "path": "bad.ipynb" })).await;
+
+    let content = &message[0]["content"];
+    assert_eq!(content.as_array().unwrap().len(), 1, "{content}");
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("kept") && text.contains("[an image output"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn read_file_decodes_notebook_images_split_over_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let picture = BASE64.encode(png(4, 4, false));
+    let (head, tail) = picture.split_at(20);
+    notebook(
+        dir.path(),
+        "split.ipynb",
+        &json!({
+            "cells": [{ "cell_type": "code", "id": "c", "metadata": {}, "source": [],
+                        "outputs": [{ "output_type": "display_data", "metadata": {},
+                                      "data": { "image/png": format!("{head}\n{tail}\n") } }] }],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+        }),
+    );
+
+    let message = read_message(dir.path(), json!({ "path": "split.ipynb" })).await;
+
+    assert_eq!(message[0]["content"][1]["type"], "image");
+}
+
+#[tokio::test]
+async fn read_file_refuses_a_notebook_it_cannot_read() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "broken.ipynb", "{not json");
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "broken.ipynb" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("not valid JSON"), "{out}");
+
+    write(dir.path(), "nocells.ipynb", "{\"metadata\":{}}");
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "nocells.ipynb" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("not a valid Jupyter notebook"), "{out}");
+
+    write(
+        dir.path(),
+        "nosource.ipynb",
+        "{\"cells\":[{\"cell_type\":\"code\",\"source\":1}]}",
+    );
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "nosource.ipynb" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("not a valid Jupyter notebook"), "{out}");
+}
+
+#[tokio::test]
+async fn read_file_refuses_a_notebook_over_its_size_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let cells = |n: usize| {
+        json!({
+            "cells": [{ "cell_type": "markdown", "id": "b", "metadata": {}, "source": ["y".repeat(n)] }],
+            "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+        })
+    };
+    let wrapper = "<cell id=\"b\"><cell_type>markdown</cell_type></cell id=\"b\">".len();
+    notebook(dir.path(), "fits.ipynb", &cells(256 * 1024 - wrapper));
+    notebook(dir.path(), "over.ipynb", &cells(256 * 1024 - wrapper + 1));
+
+    let message = read_message(dir.path(), json!({ "path": "fits.ipynb" })).await;
+    assert_eq!(message[0].get("is_error"), None);
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "over.ipynb" })).await;
+    assert!(err, "{out}");
+    assert!(
+        out.contains("exceeds maximum allowed size (256KB)"),
+        "{out}"
+    );
+
+    let file = std::fs::File::create(dir.path().join("huge.ipynb")).unwrap();
+    file.set_len(100 * 1024 * 1024 + 1).unwrap();
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "huge.ipynb" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("too large"), "{out}");
+}
