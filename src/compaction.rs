@@ -257,6 +257,8 @@ pub const BYTES_PER_TOKEN: u64 = 4;
 pub struct TouchedFiles {
     calls: HashMap<String, PathBuf>,
     paths: Vec<PathBuf>,
+    /// The data of images the API refused.
+    refused: Vec<String>,
 }
 
 impl TouchedFiles {
@@ -278,6 +280,20 @@ impl TouchedFiles {
                 self.paths.push(path);
             }
         }
+    }
+
+    /// Takes in a block the API refused; an image's data is not put back.
+    pub fn refuse(&mut self, block: &serde_json::Value) {
+        if block["type"] == "image"
+            && let Some(data) = block["source"]["data"].as_str()
+        {
+            self.refused.push(data.to_string());
+        }
+    }
+
+    /// The data of the images the API refused.
+    pub fn refused(&self) -> &[String] {
+        &self.refused
     }
 
     /// The files touched, the most recently touched last.
@@ -355,6 +371,9 @@ pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) 
                 for block in blocks {
                     match block.kind() {
                         BlockKind::Text(text) => cells.push(text.to_string()),
+                        _ if block.0["source"]["data"]
+                            .as_str()
+                            .is_some_and(|data| touched.refused().iter().any(|r| r == data)) => {}
                         _ => images.push(block),
                     }
                 }

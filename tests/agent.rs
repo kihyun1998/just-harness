@@ -969,6 +969,7 @@ async fn a_refused_document_is_replaced_with_what_happened_and_the_request_sent_
 
     assert_eq!(outcome.end, TurnEnd::Stopped(Some(StopReason::EndTurn)));
     assert_eq!(transport.requests().len(), 2);
+    assert_eq!((outcome.iterations, outcome.refused), (1, 1));
     let sent = sent_body(&transport, 1);
     assert_eq!(
         sent["messages"][2]["content"][0]["content"],

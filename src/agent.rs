@@ -78,8 +78,10 @@ pub enum TurnEnd {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnOutcome {
     pub end: TurnEnd,
-    /// Requests sent in this turn.
+    /// Replies received in this turn.
     pub iterations: u32,
+    /// Requests refused for a block they held, and sent again without it.
+    pub refused: u32,
     /// Token usage summed over the turn's requests.
     pub usage: Usage,
     pub last_message: Message,
@@ -134,10 +136,13 @@ impl<T: Transport> Agent<T> {
         approver: &mut impl Approver,
     ) -> Result<TurnOutcome, ApiError> {
         let mut iterations = 0;
+        let mut refused = 0;
         let mut usage = Usage::default();
         let mut user_stopped = false;
         loop {
-            let message = self.send_removing_refused(history, observer).await?;
+            let message = self
+                .send_removing_refused(history, observer, &mut refused)
+                .await?;
             iterations += 1;
             usage.add(&message.usage);
             append(history, observer, message.to_param());
@@ -148,7 +153,7 @@ impl<T: Transport> Agent<T> {
                 }
                 return Ok(outcome(
                     TurnEnd::StoppedByUser,
-                    iterations,
+                    (iterations, refused),
                     usage.clone(),
                     message,
                 ));
@@ -160,7 +165,12 @@ impl<T: Transport> Agent<T> {
                     if let Some(not_run) = not_run_results(&message, &why) {
                         append(history, observer, not_run);
                     }
-                    return Ok(outcome(stopped, iterations, usage.clone(), message));
+                    return Ok(outcome(
+                        stopped,
+                        (iterations, refused),
+                        usage.clone(),
+                        message,
+                    ));
                 }
                 Step::Resume => {}
                 Step::RunTools => match self.run_tools(&message, observer, approver).await {
@@ -168,13 +178,20 @@ impl<T: Transport> Agent<T> {
                         append(history, observer, results);
                         user_stopped = stop;
                     }
-                    None => return Ok(outcome(stopped, iterations, usage.clone(), message)),
+                    None => {
+                        return Ok(outcome(
+                            stopped,
+                            (iterations, refused),
+                            usage.clone(),
+                            message,
+                        ));
+                    }
                 },
             }
             if !user_stopped && iterations >= self.max_iterations {
                 return Ok(outcome(
                     TurnEnd::IterationLimit,
-                    iterations,
+                    (iterations, refused),
                     usage.clone(),
                     message,
                 ));
@@ -188,6 +205,7 @@ impl<T: Transport> Agent<T> {
         &self,
         history: &mut [MessageParam],
         observer: &mut impl Observer,
+        refused: &mut u32,
     ) -> Result<Message, ApiError> {
         loop {
             let error = match self.send(history.to_vec(), observer).await {
@@ -199,7 +217,10 @@ impl<T: Transport> Agent<T> {
                 remove_refused_block(history, refused.kind, refused.place, &text)
             });
             match removed {
-                Some(removed) => observer.on_block_removed(&removed),
+                Some(removed) => {
+                    *refused += 1;
+                    observer.on_block_removed(&removed);
+                }
                 None => return Err(error),
             }
         }
@@ -363,10 +384,16 @@ fn append(history: &mut Vec<MessageParam>, observer: &mut impl Observer, message
     }
 }
 
-fn outcome(end: TurnEnd, iterations: u32, usage: Usage, last_message: Message) -> TurnOutcome {
+fn outcome(
+    end: TurnEnd,
+    (iterations, refused): (u32, u32),
+    usage: Usage,
+    last_message: Message,
+) -> TurnOutcome {
     TurnOutcome {
         end,
         iterations,
+        refused,
         usage,
         last_message,
     }

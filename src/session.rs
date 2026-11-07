@@ -242,7 +242,11 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
                 Err(_) => skipped += 1,
             },
             Some("block_removed") => match serde_json::from_value(record.clone()) {
-                Ok(removed) => replace_block(&mut history, &removed),
+                Ok(removed) => {
+                    if let Some(old) = replace_block(&mut history, &removed) {
+                        touched.refuse(&old);
+                    }
+                }
                 Err(_) => skipped += 1,
             },
             Some("clear") => match record["before"].as_u64() {

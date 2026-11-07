@@ -918,3 +918,36 @@ fn a_file_of_the_format_before_removed_blocks_still_loads() {
     assert_eq!(load(log.path()).unwrap().history.len(), 1);
     assert_eq!(FORMAT_VERSION, 7);
 }
+
+#[test]
+fn a_removed_image_is_remembered_as_refused_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = json!({
+        "type": "image",
+        "source": { "type": "base64", "media_type": "image/png", "data": "ZGF0YQ==" },
+    });
+    let mut messages = vec![
+        text(Role::User, "look"),
+        tool_call("toolu_1"),
+        MessageParam {
+            role: Role::User,
+            content: vec![ContentBlock::tool_result_blocks(
+                "toolu_1",
+                vec![ContentBlock(image.clone())],
+                false,
+            )],
+        },
+    ];
+    let mut log = SessionLog::create(dir.path(), &meta("s")).unwrap();
+    for message in &messages {
+        log.append(message).unwrap();
+    }
+    let removed =
+        just_harness::clearing::remove_newest_block(&mut messages, "image", "gone").unwrap();
+    assert_eq!(removed.old, Some(image.clone()));
+    log.record_block_removed(&removed).unwrap();
+
+    let loaded = load(log.path()).unwrap();
+
+    assert_eq!(loaded.touched.refused(), ["ZGF0YQ=="]);
+}

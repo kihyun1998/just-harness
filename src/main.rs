@@ -39,6 +39,8 @@ const USAGE: &str =
 /// appends each message the loop adds to the session log.
 struct Terminal<'a> {
     log: &'a mut Log,
+    /// Blocks taken out in this turn.
+    removed: Vec<RemovedBlock>,
     /// Each request's usage in this turn, with when it ended.
     usages: Vec<(Usage, Instant)>,
 }
@@ -54,6 +56,7 @@ impl Observer for Terminal<'_> {
 
     fn on_block_removed(&mut self, removed: &RemovedBlock) {
         self.log.record_block_removed(removed);
+        self.removed.push(removed.clone());
         println!("\n{}", one_line(&removed.text, 160));
     }
 
@@ -365,6 +368,7 @@ async fn compact<T: Transport>(
     }
     let mut terminal = Terminal {
         log,
+        removed: Vec::new(),
         usages: Vec::new(),
     };
     let result = tokio::select! {
@@ -855,6 +859,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         history.push(message);
         let mut terminal = Terminal {
             log: &mut log,
+            removed: Vec::new(),
             usages: Vec::new(),
         };
         let mut approver = Prompt {
@@ -866,6 +871,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => None,
         };
         let usages = std::mem::take(&mut terminal.usages);
+        let removed = std::mem::take(&mut terminal.removed);
+        for block in removed.iter().filter_map(|r| r.old.as_ref()) {
+            touched.refuse(block);
+        }
         last_prompt = usages.last().map(|(usage, _)| usage.history_tokens());
         if let Some((usage, _)) = usages.first() {
             compact_guard.first_request(usage.prompt_tokens(), &compacting);
@@ -888,16 +897,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(outcome) => match outcome.end {
                 TurnEnd::StoppedByUser => {
-                    println!("\n[stopped by you after {} requests]", outcome.iterations)
+                    println!(
+                        "\n[stopped by you after {} requests]",
+                        outcome.iterations + outcome.refused
+                    )
                 }
                 TurnEnd::IterationLimit => {
                     println!(
                         "\n[stopped after {} requests: the iteration limit]",
-                        outcome.iterations
+                        outcome.iterations + outcome.refused
                     )
                 }
                 TurnEnd::Stopped(reason) => {
-                    println!("\n[{reason:?} · {} requests]", outcome.iterations)
+                    println!(
+                        "\n[{reason:?} · {} requests]",
+                        outcome.iterations + outcome.refused
+                    )
                 }
             },
             Err(error) => {
@@ -910,7 +925,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         report_usage(&usages, &mut cached, args.cache);
-        if failed {
+        if failed || !removed.is_empty() {
             cached = None;
         }
         if too_long {

@@ -930,3 +930,20 @@ fn a_pdf_does_not_come_back_or_take_a_place() {
 
     assert_eq!(back, PutBack::default());
 }
+
+#[test]
+fn a_notebook_image_the_api_refused_does_not_come_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    write_aged(&root, "n.ipynb", notebook_with_picture(), 1);
+    let mut touched = touched_by(&[("read_file", "n.ipynb", false)], &root);
+    let ctx = ToolContext::new(&root).unwrap();
+    let image = put_back(&touched, &ctx, &[]).message.unwrap().content[1].clone();
+
+    touched.refuse(&image.0);
+    let back = put_back(&touched, &ctx, &[]);
+
+    let message = back.message.unwrap();
+    assert_eq!(message.content.len(), 1, "{:?}", message.content);
+    assert!(message_text(&message).contains("<cell id=\"c1\">"));
+}

@@ -133,6 +133,9 @@ pub struct RemovedBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested: Option<usize>,
     pub text: String,
+    /// The block taken out; not recorded.
+    #[serde(skip)]
+    pub old: Option<Value>,
 }
 
 /// What stands in for a block of `kind` the API could not process, for `reason`.
@@ -161,13 +164,14 @@ pub fn remove_refused_block(
     let found = place
         .filter(|&place| holds(history, place, kind))
         .or_else(|| newest(history, kind))?;
-    let removed = RemovedBlock {
+    let mut removed = RemovedBlock {
         message: found.0,
         block: found.1,
         nested: found.2,
         text: text.to_string(),
+        old: None,
     };
-    replace_block(history, &removed);
+    removed.old = replace_block(history, &removed);
     Some(removed)
 }
 
@@ -225,15 +229,13 @@ fn newest(history: &[MessageParam], kind: &str) -> Option<(usize, usize, Option<
         })
 }
 
-/// Applies `removed` to `history`, and removes every thinking block after the
-/// message it changes. A place that is not there changes nothing.
-pub fn replace_block(history: &mut [MessageParam], removed: &RemovedBlock) {
-    let Some(block) = history
+/// Applies `removed` to `history`, removes every thinking block after the
+/// message it changes, and returns the block it took out. A place that is not
+/// there changes nothing.
+pub fn replace_block(history: &mut [MessageParam], removed: &RemovedBlock) -> Option<Value> {
+    let block = history
         .get_mut(removed.message)
-        .and_then(|message| message.content.get_mut(removed.block))
-    else {
-        return;
-    };
+        .and_then(|message| message.content.get_mut(removed.block))?;
     let text = json!({ "type": "text", "text": removed.text });
     let place = match removed.nested {
         Some(nested) => block
@@ -243,10 +245,9 @@ pub fn replace_block(history: &mut [MessageParam], removed: &RemovedBlock) {
             .and_then(|inner| inner.get_mut(nested)),
         None => Some(&mut block.0),
     };
-    if let Some(place) = place {
-        *place = text;
-        remove_thinking_from(history, removed.message + 1);
-    }
+    let old = std::mem::replace(place?, text);
+    remove_thinking_from(history, removed.message + 1);
+    Some(old)
 }
 
 /// Whether the last message carries tool results, which the model has not

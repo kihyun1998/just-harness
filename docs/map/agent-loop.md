@@ -50,7 +50,7 @@ These are judgements, the maintainer's to reverse.
 
 ## read_file
 
-A text file comes back as numbered lines, `DEFAULT_READ_LIMIT` lines by default, at most `MAX_READ_BYTES` per call (the rest is left for the next `offset`), lines past `MAX_LINE_CHARS` characters cut with a note. `str::lines` drops a trailing `\r`, so a CRLF file reads like an LF one.
+A text file comes back as numbered lines (a FIFO with a text extension or none blocks the read, as before #21; git cannot hold one, so a cloned repository does not bring it; the maintainer chose to leave it, 2026-11-07), `DEFAULT_READ_LIMIT` lines by default, at most `MAX_READ_BYTES` per call (the rest is left for the next `offset`), lines past `MAX_LINE_CHARS` characters cut with a note. `str::lines` drops a trailing `\r`, so a CRLF file reads like an LF one.
 
 ### What a file is read as
 
@@ -93,9 +93,12 @@ A 400 whose message mentions an image or a PDF takes the newest block of that ki
 
 Measured on Claude Code 2.1.319 against a local fake API (2026-11-07): `Could not process image`, `image exceeds 5 MB maximum`, `image dimensions exceed`, a wrong image `media type`, `The PDF specified was not valid.`, `PDF is password protected.` and `A maximum of 100 PDF pages` all did this, in these words, with `messages.N...:` taken off the reason; `bad thing` and `document: unsupported` with no such word were errors, retried. With two images and only the newer refused, the newer went. Differences here:
 
-- The match is the word "image" or "pdf" in any case, wider than those measured. Claude Code's rule was not read, and the real API's wording could not be probed with the key at a 401, so another wording stays an ordinary error and a session can still stick on it.
+- The match is the word "image" or "pdf" in any case, wider than those measured. Claude Code's rule was not read, and the real API's wording could not be probed with the key at a 401, so another wording stays an ordinary error and a session can still stick on it; a 400 about something else that mentions an image takes images out one by one.
 - Claude Code leaves the error body in the reason when the message has no path; this keeps the message alone.
+- Both are the maintainer's call (2026-11-07), shown against narrowing the match to the measured wordings and copying the body, and against leaving both unrecorded.
 - A message naming a block by its path (`messages.<m>.content.<b>`, then `.tool_result.content.<n>` inside a result) takes out that block when it is of the refused kind, since `Agent::send` sends the history as it is and the indexes match; otherwise the newest of that kind goes, as with no path. Taking the newest when the API named another would tell the model a good file is corrupt, which a review pass found for two PDFs read in one reply. Claude Code with several blocks and a path was not measured.
+
+The turn's summary counts the refused requests among its requests (`TurnOutcome::refused`). The REPL forgets the last cached request after a removal, as after a clear, since the next request's prefix differs. A notebook image taken out is not put back after a compaction ([compaction](compaction.md)): `TouchedFiles` keeps the data of refused images, and `load` rebuilds it from the `block_removed` records.
 
 Taking a block out changes the history for every later thinking block, so those are removed as a clear removes them ([tool-result-clearing](tool-result-clearing.md)); thinking at or before the changed message stays. Whether the API accepts that in a history ending with results is the open question from clearing, and a refusal of it would be an ordinary error. The summary request (`Agent::send`) does not do this: a refused block makes it an attempt that failed ([compaction](compaction.md)), and the next line, through `run_turn`, takes the block out. A 413 is not handled here: it still means a compaction, though Claude Code's errors page says it retries with images and documents stripped when they caused the size.
 
