@@ -50,7 +50,7 @@ These are judgements, the maintainer's to reverse.
 
 ## read_file
 
-Numbered lines, `DEFAULT_READ_LIMIT` lines by default, at most `MAX_READ_BYTES` per call (the rest is left for the next `offset`), lines past `MAX_LINE_CHARS` characters cut with a note. `str::lines` drops a trailing `\r`, so a CRLF file reads like an LF one.
+A text file comes back as numbered lines, `DEFAULT_READ_LIMIT` lines by default, at most `MAX_READ_BYTES` per call (the rest is left for the next `offset`), lines past `MAX_LINE_CHARS` characters cut with a note. `str::lines` drops a trailing `\r`, so a CRLF file reads like an LF one.
 
 ### What a file is read as
 
