@@ -8,13 +8,24 @@ use serde_json::Value;
 use super::image;
 use crate::api::ContentBlock;
 
-/// The most bytes of cell and output text a notebook comes to.
-pub const MAX_TEXT_BYTES: usize = 256 * 1024;
-/// The most bytes of text one cell's outputs keep.
+/// The most bytes of cell and output text and image data a notebook comes to.
+const MAX_CONTENT_BYTES: usize = 256 * 1024;
+/// The most tokens of text a notebook comes to.
+const MAX_TEXT_TOKENS: usize = 25_000;
+/// The bytes of text counted as one token.
+const BYTES_PER_TOKEN: usize = 4;
+/// The most bytes of text and image data one cell's outputs keep.
 const MAX_OUTPUT_BYTES: usize = 10_000;
 
 const NOT_A_NOTEBOOK: &str = "Notebook file is not a valid Jupyter notebook (top-level \"cells\" \
     must be an array of cell objects, each with a string or string-array \"source\").";
+
+const READ_A_PORTION: &str = "Use a shell command with jq to read specific portions:\n  \
+    cat <notebook_path> | jq '.cells[:20]' # First 20 cells\n  \
+    cat <notebook_path> | jq '.cells[100:120]' # Cells 100-120\n  \
+    cat <notebook_path> | jq '.cells | length' # Count total cells\n  \
+    cat <notebook_path> | jq '.cells[] | select(.cell_type==\"code\") | .source' # All code \
+    sources";
 
 /// Text pieces joined by a line end, and the blocks they became, in order.
 #[derive(Default)]
@@ -22,6 +33,7 @@ struct Blocks {
     blocks: Vec<ContentBlock>,
     pieces: Vec<String>,
     text_bytes: usize,
+    image_bytes: usize,
 }
 
 impl Blocks {
@@ -33,6 +45,18 @@ impl Blocks {
     fn block(&mut self, block: ContentBlock) {
         self.flush();
         self.blocks.push(block);
+    }
+
+    /// Refuses a notebook whose content so far is over [`MAX_CONTENT_BYTES`].
+    fn check_size(&self) -> Result<(), String> {
+        let bytes = self.text_bytes + self.image_bytes;
+        if bytes > MAX_CONTENT_BYTES {
+            return Err(format!(
+                "Notebook content ({}KB) exceeds maximum allowed size (256KB). {READ_A_PORTION}",
+                bytes / 1024
+            ));
+        }
+        Ok(())
     }
 
     fn flush(&mut self) {
@@ -61,16 +85,12 @@ pub fn render(bytes: &[u8]) -> Result<Vec<ContentBlock>, String> {
         render_cell(cell, index, language, &mut out)?;
     }
     out.flush();
-    if out.text_bytes > MAX_TEXT_BYTES {
+    out.check_size()?;
+    if out.text_bytes > MAX_TEXT_TOKENS * BYTES_PER_TOKEN {
         return Err(format!(
-            "Notebook content ({}KB) exceeds maximum allowed size (256KB). Use a shell command \
-             with jq to read specific portions:\n  \
-             cat <notebook_path> | jq '.cells[:20]' # First 20 cells\n  \
-             cat <notebook_path> | jq '.cells[100:120]' # Cells 100-120\n  \
-             cat <notebook_path> | jq '.cells | length' # Count total cells\n  \
-             cat <notebook_path> | jq '.cells[] | select(.cell_type==\"code\") | .source' # All \
-             code sources",
-            out.text_bytes / 1024
+            "Notebook content (about {} tokens) exceeds the limit of {MAX_TEXT_TOKENS} tokens. \
+             {READ_A_PORTION}",
+            out.text_bytes / BYTES_PER_TOKEN
         ));
     }
     Ok(out.blocks)
@@ -98,11 +118,9 @@ fn render_cell(cell: &Value, index: usize, language: &str, out: &mut Blocks) -> 
     ));
 
     let outputs = cell["outputs"].as_array().map_or(&[][..], Vec::as_slice);
-    let output_bytes: usize = outputs
-        .iter()
-        .filter_map(output_text)
-        .map(|text| text.len())
-        .sum();
+    let text_bytes = outputs.iter().filter_map(output_text).map(|t| t.len());
+    let image_bytes = outputs.iter().filter_map(output_image).map(|d| d.len());
+    let output_bytes: usize = text_bytes.chain(image_bytes).sum();
     if output_bytes > MAX_OUTPUT_BYTES {
         out.text(format!(
             "\nOutputs are too large to include. Use a shell command: cat <notebook_path> | jq \
@@ -115,6 +133,7 @@ fn render_cell(cell: &Value, index: usize, language: &str, out: &mut Blocks) -> 
             out.text(format!("\n{text}"));
         }
         if let Some(data) = output_image(output) {
+            out.image_bytes += data.len();
             match image_block(data) {
                 Some(block) => out.block(block),
                 None => out.text("\n[an image output could not be read]".to_string()),

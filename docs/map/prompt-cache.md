@@ -31,4 +31,6 @@ A miss is judged per request, not on the turn's total: in a healthy loop each re
 
 ## Not built
 
+Images and documents were not measured against the cache, since that takes a live key. The caching page's table says adding or removing images anywhere in the prompt breaks the message cache, which a session's first image and a clear of one would do, and its 20-block lookback does not say whether blocks nested in a `tool_result` count. `Usage::cache_shortfall` would show either in real use.
+
 No pre-warming, no keep-alive requests, no automatic choice of the 1-hour TTL. Whether Ollama's Messages compatibility (the later local-model goal) accepts `cache_control` has not been checked.

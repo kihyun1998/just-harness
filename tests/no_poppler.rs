@@ -1,5 +1,4 @@
-//! `read_file` on a PDF when poppler's tools are not on the `PATH`. One test,
-//! in a process of its own, because it empties the `PATH`.
+//! `read_file` on a PDF when poppler's tools are not on the `PATH`.
 
 mod support;
 
@@ -31,8 +30,7 @@ async fn read(root: &std::path::Path, input: Value) -> Value {
 
 #[tokio::test]
 async fn a_pdf_is_sent_whole_and_a_page_range_says_what_to_install() {
-    // SAFETY: this is the only test in this process, and nothing else here
-    // reads the environment while it is set.
+    // SAFETY: this is the only test in this process.
     unsafe { std::env::set_var("PATH", "") };
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.pdf"), "%PDF-1.4\n").unwrap();

@@ -212,6 +212,11 @@ fn read_image(path: &Path, shown: &str) -> Result<ToolOutput, String> {
 
 fn read_notebook(path: &Path, shown: &str) -> Result<ToolOutput, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "Cannot read this as a notebook: {shown} is not a regular file."
+        ));
+    }
     if meta.len() > MAX_NOTEBOOK_FILE_BYTES {
         return Err(format!(
             "Notebook file is too large to read (the limit is 100MB): {shown}. Read a portion \

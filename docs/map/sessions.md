@@ -37,6 +37,10 @@ The `a` allow-for-the-session answers (see [agent-loop](agent-loop.md), Approval
 
 Checked on 2026-10-29 against a local fake API with `HOME` in a scratch folder: start and quit (no file), `--continue` with nothing saved, a new session then `--continue` (the next request carried the earlier messages; file 0600, folders 0700), a cancelled turn (dropped, not restored), and `--resume <path>` on a file ending in a cut line after an unanswered call (skipped, warned, answered, next request valid). `main.rs` has no automated test; neither does `sync_data`, nor `latest` skipping an entry whose metadata cannot be read.
 
+## Images and documents in the file
+
+A `tool_result` holding blocks is written as it is, base64 included (#21), so a session that read a PDF of 60 MB holds 80 MB of base64, and the whole file is read on a resume. A drop or a clear appends a record and takes nothing out: a review pass measured a 60 MB PDF read and refused three times as a 240 MB file with no messages left, 656 MB of memory and 2.9 s to continue, on a debug build. `--continue` and `--resume <id>` can read other sessions' files whole on the way, so they pay for these too. Images are kept small by the resize rules ([agent-loop](agent-loop.md)); documents are not. Claude Code's session file was not measured. A result holding blocks does not move `FORMAT_VERSION`: `load` keeps a block as JSON, and an older build reads it too.
+
 ## Not built
 
 No listing of sessions, no cleanup of old ones, no locking against two processes writing one file.

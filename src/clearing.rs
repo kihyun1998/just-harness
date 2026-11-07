@@ -33,8 +33,7 @@ impl Default for ClearPolicy {
     }
 }
 
-/// The most bytes an `image` block's data counts for: the most visual tokens
-/// an image can cost, 4,784, at 4 bytes each.
+/// The most bytes an `image` block's data counts for.
 pub const MAX_IMAGE_BYTES: usize = 19_136;
 
 /// What one [`clear_before`] changed.

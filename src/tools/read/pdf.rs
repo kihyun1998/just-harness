@@ -154,7 +154,8 @@ async fn read_pages(
     })
 }
 
-/// The page count `pdfinfo` reports, or `None` when it cannot tell.
+/// The page count `pdfinfo` reports, or `None` when it cannot tell. The last
+/// `Pages:` line is the count: the document's title comes before it.
 async fn page_count(path: &Path) -> Option<u64> {
     let output = quiet(Command::new("pdfinfo").arg(path))
         .output()
@@ -165,6 +166,7 @@ async fn page_count(path: &Path) -> Option<u64> {
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
+        .rev()
         .find_map(|line| line.strip_prefix("Pages:")?.trim().parse().ok())
 }
 
@@ -186,23 +188,26 @@ async fn render_page(path: &Path, page: u64) -> Result<Vec<u8>, String> {
     })?;
     if !output.status.success() {
         return Err(format!(
-            "pdftoppm could not render page {page}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "pdftoppm could not render page {page}: the PDF file may be corrupted or invalid."
         ));
     }
     Ok(output.stdout)
 }
 
-/// `command` with no stdin, its output captured, and killed if dropped.
+/// `command` with no stdin, its stdout captured, its stderr discarded, and
+/// killed if dropped.
 fn quiet(command: &mut Command) -> &mut Command {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
 }
 
 fn size_text(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
     let (value, unit) = if bytes < 1024 * 1024 {
         (bytes as f64 / 1024.0, "KB")
     } else {

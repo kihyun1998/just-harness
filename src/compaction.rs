@@ -300,8 +300,9 @@ pub struct PutBack {
 /// The message bringing back up to [`PUT_BACK_FILES`] of the `touched` files,
 /// most recently modified first, read from disk now. A file over
 /// [`PUT_BACK_MAX_TOKENS`] comes back as its path, whatever it holds. A file
-/// that is gone, is one of `carried`, is not a regular file, is an image, is
-/// neither UTF-8 text nor a readable notebook at or under that size, or that
+/// that is gone, is one of `carried`, is not a regular file, is an image, a PDF
+/// or of a binary format, is neither UTF-8 text nor a readable notebook at or
+/// under that size, or that
 /// `ctx` refuses is left out and takes no place. A notebook comes back as its
 /// cells, its images after the message's text.
 pub fn put_back(touched: &TouchedFiles, ctx: &ToolContext, carried: &[PathBuf]) -> PutBack {

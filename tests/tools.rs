@@ -1271,11 +1271,16 @@ async fn read_file_refuses_a_notebook_over_its_size_limits() {
         })
     };
     let wrapper = "<cell id=\"b\"><cell_type>markdown</cell_type></cell id=\"b\">".len();
-    notebook(dir.path(), "fits.ipynb", &cells(256 * 1024 - wrapper));
+    notebook(dir.path(), "fits.ipynb", &cells(100_000 - wrapper));
+    notebook(dir.path(), "tokens.ipynb", &cells(100_000 - wrapper + 1));
     notebook(dir.path(), "over.ipynb", &cells(256 * 1024 - wrapper + 1));
 
     let message = read_message(dir.path(), json!({ "path": "fits.ipynb" })).await;
     assert_eq!(message[0].get("is_error"), None);
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "tokens.ipynb" })).await;
+    assert!(err, "{out}");
+    assert!(out.contains("25000 tokens"), "{out}");
 
     let (out, err) = call(dir.path(), "read_file", json!({ "path": "over.ipynb" })).await;
     assert!(err, "{out}");
@@ -1293,6 +1298,11 @@ async fn read_file_refuses_a_notebook_over_its_size_limits() {
 
 /// A PDF of `pages` empty pages of 200x200 points.
 fn pdf(pages: usize) -> Vec<u8> {
+    titled_pdf(pages, None)
+}
+
+/// [`pdf`], with `title` in its document information.
+fn titled_pdf(pages: usize, title: Option<&str>) -> Vec<u8> {
     let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 3 + i)).collect();
     let mut objects = vec![
         "<</Type/Catalog/Pages 2 0 R>>".to_string(),
@@ -1301,6 +1311,10 @@ fn pdf(pages: usize) -> Vec<u8> {
     for _ in 0..pages {
         objects.push("<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>".to_string());
     }
+    let info = title.map(|title| {
+        objects.push(format!("<</Title({title})>>"));
+        format!("/Info {} 0 R", objects.len())
+    });
     let mut out = String::from("%PDF-1.4\n");
     let mut offsets = Vec::new();
     for (i, object) in objects.iter().enumerate() {
@@ -1313,8 +1327,9 @@ fn pdf(pages: usize) -> Vec<u8> {
         out += &format!("{offset:010} 00000 n \n");
     }
     out += &format!(
-        "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{table}\n%%EOF\n",
-        objects.len() + 1
+        "trailer<</Size {}/Root 1 0 R{}>>\nstartxref\n{table}\n%%EOF\n",
+        objects.len() + 1,
+        info.unwrap_or_default()
     );
     out.into_bytes()
 }
@@ -1533,4 +1548,197 @@ async fn read_file_gives_a_pdfs_size_in_kilobytes_without_a_bare_decimal() {
         let text = message[0]["content"][0]["text"].as_str().unwrap();
         assert!(text.ends_with(shown), "{text}");
     }
+}
+
+fn picture_output(data: &str) -> Value {
+    json!({ "output_type": "display_data", "metadata": {}, "data": { "image/png": data } })
+}
+
+fn notebook_of(outputs: Vec<Value>) -> Value {
+    json!({
+        "cells": [{ "cell_type": "code", "id": "c", "metadata": {}, "source": [], "outputs": outputs }],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    })
+}
+
+#[tokio::test]
+async fn read_file_counts_a_notebooks_images_among_its_outputs_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = BASE64.encode(png(30, 30, true));
+    assert!(kept.len() < 10_000, "{}", kept.len());
+    let large = BASE64.encode(png(100, 100, true));
+    assert!(large.len() > 10_000, "{}", large.len());
+    let small = BASE64.encode(png(1, 1, false));
+    notebook(
+        dir.path(),
+        "kept.ipynb",
+        &notebook_of(vec![picture_output(&kept)]),
+    );
+    notebook(
+        dir.path(),
+        "large.ipynb",
+        &notebook_of(vec![picture_output(&large)]),
+    );
+    let many = vec![picture_output(&small); 10_000 / small.len() + 1];
+    notebook(dir.path(), "many.ipynb", &notebook_of(many));
+
+    let message = read_message(dir.path(), json!({ "path": "kept.ipynb" })).await;
+    assert_eq!(message[0]["content"][1]["type"], "image");
+
+    for name in ["large.ipynb", "many.ipynb"] {
+        let message = read_message(dir.path(), json!({ "path": name })).await;
+        let content = &message[0]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 1, "{name}");
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("too large to include"),
+            "{name}: {content}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_file_counts_a_notebooks_images_toward_its_size() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each cell's image is under the outputs' limit; together over 256 KB.
+    let data = "A".repeat(9_000);
+    let cells: Vec<Value> = (0..30)
+        .map(|i| {
+            json!({ "cell_type": "code", "id": format!("c{i}"), "metadata": {}, "source": [],
+                    "outputs": [picture_output(&data)] })
+        })
+        .collect();
+    notebook(
+        dir.path(),
+        "plots.ipynb",
+        &json!({ "cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 5 }),
+    );
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "plots.ipynb" })).await;
+
+    assert!(err, "{out}");
+    assert!(
+        out.contains("exceeds maximum allowed size (256KB)"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn read_file_gives_the_scale_of_a_tall_narrow_image_by_its_long_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tall.png"), png(1, 3000, false)).unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "tall.png" })).await;
+
+    assert_eq!(
+        message[1]["text"],
+        "[Image: original 1x3000, displayed at 1x2000. Multiply coordinates by 1.50 to map to original image.]"
+    );
+}
+
+/// The CRC-32 of `bytes`, as a PNG chunk carries it.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = (data.len() as u32).to_be_bytes().to_vec();
+    let body = [&kind[..], data].concat();
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+    out
+}
+
+#[tokio::test]
+async fn read_file_says_what_to_do_with_an_image_too_large_to_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut header = Vec::new();
+    header.extend_from_slice(&30_000u32.to_be_bytes());
+    header.extend_from_slice(&30_000u32.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend(png_chunk(b"IHDR", &header));
+    bytes.extend(png_chunk(b"IDAT", &[]));
+    bytes.extend(png_chunk(b"IEND", &[]));
+    std::fs::write(dir.path().join("vast.png"), bytes).unwrap();
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "vast.png" })).await;
+
+    assert!(err, "{out}");
+    assert!(out.contains("resize it or export a smaller copy"), "{out}");
+}
+
+#[tokio::test]
+async fn read_file_refuses_a_pipe_named_as_a_media_file_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["pipe.ipynb", "pipe.png", "pipe.pdf"] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(dir.path().join(name))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (out, err) = call(dir.path(), "read_file", json!({ "path": name })).await;
+        assert!(err, "{name}: {out}");
+        assert!(out.contains("not a regular file"), "{name}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn read_file_is_not_fooled_about_a_pdfs_pages_by_its_title() {
+    if !poppler() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let few = titled_pdf(12, Some("x\nPages:           1"));
+    std::fs::write(dir.path().join("few.pdf"), few).unwrap();
+    let many = titled_pdf(3, Some("x\nPages:           999"));
+    std::fs::write(dir.path().join("many.pdf"), many).unwrap();
+
+    let (out, err) = call(dir.path(), "read_file", json!({ "path": "few.pdf" })).await;
+    assert!(err && out.contains("has 12 pages"), "{out}");
+
+    let message = read_message(dir.path(), json!({ "path": "many.pdf" })).await;
+    assert_eq!(kinds(&message[0]["content"]), ["text", "document"]);
+}
+
+#[tokio::test]
+async fn read_file_keeps_a_failed_render_to_a_short_error() {
+    if !poppler() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut noisy = b"%PDF-1.4\n".to_vec();
+    noisy.extend(std::iter::repeat_n(b"1 0 obj<<>>endobj garbage\n".as_slice(), 2_000).flatten());
+    std::fs::write(dir.path().join("broken.pdf"), noisy).unwrap();
+
+    let (out, err) = call(
+        dir.path(),
+        "read_file",
+        json!({ "path": "broken.pdf", "pages": "1" }),
+    )
+    .await;
+
+    assert!(err, "{out}");
+    assert!(out.contains("corrupted or invalid"), "{out}");
+    assert!(out.len() < 300, "{}", out.len());
+}
+
+#[tokio::test]
+async fn read_file_gives_a_small_pdfs_size_in_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tiny.pdf"), "%PDF-1.4\n").unwrap();
+
+    let message = read_message(dir.path(), json!({ "path": "tiny.pdf" })).await;
+
+    let text = message[0]["content"][0]["text"].as_str().unwrap();
+    assert!(text.ends_with("(9B)"), "{text}");
 }

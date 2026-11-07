@@ -6,7 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+use image::{DynamicImage, ImageError, ImageFormat, Rgb, RgbImage};
 use serde_json::json;
 
 use crate::api::ContentBlock;
@@ -45,8 +45,14 @@ pub fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
 /// `bytes`, of `format`, within the size limits: unchanged when they already
 /// are, or decoded, resized and encoded again.
 pub fn prepare(bytes: &[u8], format: ImageFormat) -> Result<Prepared, String> {
-    let decoded = image::load_from_memory_with_format(bytes, format)
-        .map_err(|e| format!("could not be decoded as an image: {e}"))?;
+    let decoded = image::load_from_memory_with_format(bytes, format).map_err(|e| match e {
+        ImageError::Limits(_) => {
+            "is too large to decode as an image; resize it or export a smaller copy, then read \
+             that."
+                .to_string()
+        }
+        other => format!("could not be decoded as an image: {other}"),
+    })?;
     let (width, height) = (decoded.width(), decoded.height());
     let (new_width, new_height) = within_edge(width, height);
     let resized = (new_width, new_height) != (width, height);
@@ -73,7 +79,7 @@ pub fn prepare(bytes: &[u8], format: ImageFormat) -> Result<Prepared, String> {
             format!(
                 "[Image: original {width}x{height}, displayed at {new_width}x{new_height}. \
                  Multiply coordinates by {:.2} to map to original image.]",
-                f64::from(width) / f64::from(new_width)
+                f64::from(width.max(height)) / f64::from(new_width.max(new_height))
             )
         }),
     })

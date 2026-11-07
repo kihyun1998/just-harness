@@ -24,7 +24,7 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 SUMMARY_REQUEST = "The conversation is about"
-CARRIED = "<"
+CARRIED = ("<", "[Image:")
 SUMMARY = "<summary>SUMMARY OF WORK</summary>"
 
 
@@ -42,7 +42,7 @@ def last_user_line(messages):
         lines = [
             text
             for text in texts(message)
-            if not text.startswith((SUMMARY_REQUEST, CARRIED))
+            if not text.startswith((SUMMARY_REQUEST, *CARRIED))
         ]
         if lines:
             return lines[-1]
